@@ -46,6 +46,7 @@ type File struct {
 	Liveness  Liveness  `yaml:"liveness"`
 	Lifecycle Lifecycle `yaml:"lifecycle"`
 	Traffic   Traffic   `yaml:"traffic"`
+	UDP       UDP       `yaml:"udp"`
 	Gen       Gen       `yaml:"gen"`
 	Profiles  []Profile `yaml:"profiles"`
 	Failover  Failover  `yaml:"failover"`
@@ -69,6 +70,7 @@ type Profile struct {
 	Liveness  Liveness  `yaml:"liveness"`
 	Lifecycle Lifecycle `yaml:"lifecycle"`
 	Traffic   Traffic   `yaml:"traffic"`
+	UDP       UDP       `yaml:"udp"`
 }
 
 // Failover controls ordered profile failover.
@@ -174,6 +176,19 @@ type Traffic struct {
 	MaxPayloadSize int    `yaml:"max_payload_size"`
 	MinDelay       string `yaml:"min_delay"`
 	MaxDelay       string `yaml:"max_delay"`
+}
+
+// UDP controls the lossy SOCKS5 UDP ASSOCIATE relay.
+//
+// ProofKit fork: the relay is OFF unless the yaml opts in with
+// `udp: { enabled: true }` (upstream shipped it on-by-default with only a
+// `disabled` escape hatch). A config without a udp block therefore behaves
+// byte-identically to the pre-UDP fork build. `disabled: true` still wins
+// over `enabled: true` so upstream configs keep their meaning.
+type UDP struct {
+	Enabled  *bool `yaml:"enabled"`
+	Disabled *bool `yaml:"disabled"`
+	MaxFlows *int  `yaml:"max_flows"`
 }
 
 // Gen controls room-generation mode.
@@ -302,6 +317,17 @@ func Apply(dst session.Config, f File) session.Config {
 	dst.TrafficMaxPayloadSize = pickInt(dst.TrafficMaxPayloadSize, f.Traffic.MaxPayloadSize)
 	dst.TrafficMinDelay = pickString(dst.TrafficMinDelay, f.Traffic.MinDelay)
 	dst.TrafficMaxDelay = pickString(dst.TrafficMaxDelay, f.Traffic.MaxDelay)
+	// ProofKit fork gate: UDP relay is opt-in. Without `udp: { enabled: true }`
+	// the session runs UDP-disabled regardless of upstream defaults; an
+	// explicit `disabled: true` (yaml below, or CLI-set on dst) always wins
+	// over `enabled: true`.
+	dst.UDPDisabled = dst.UDPDisabled || f.UDP.Enabled == nil || !*f.UDP.Enabled
+	if f.UDP.Disabled != nil {
+		dst.UDPDisabled = dst.UDPDisabled || *f.UDP.Disabled
+	}
+	if f.UDP.MaxFlows != nil {
+		dst.UDPMaxFlows = pickInt(dst.UDPMaxFlows, *f.UDP.MaxFlows)
+	}
 	dst.Amount = pickInt(dst.Amount, f.Gen.Amount)
 	return dst
 }
@@ -350,6 +376,17 @@ func ApplyProfile(base session.Config, p Profile) session.Config {
 	dst.TrafficMaxPayloadSize = overlayInt(dst.TrafficMaxPayloadSize, p.Traffic.MaxPayloadSize)
 	dst.TrafficMinDelay = overlayString(dst.TrafficMinDelay, p.Traffic.MinDelay)
 	dst.TrafficMaxDelay = overlayString(dst.TrafficMaxDelay, p.Traffic.MaxDelay)
+	// ProofKit fork gate: a failover profile may flip the UDP opt-in, with an
+	// explicit `disabled: true` still winning (mirrors Apply above).
+	if p.UDP.Enabled != nil {
+		dst.UDPDisabled = !*p.UDP.Enabled
+	}
+	if p.UDP.Disabled != nil {
+		dst.UDPDisabled = dst.UDPDisabled || *p.UDP.Disabled
+	}
+	if p.UDP.MaxFlows != nil {
+		dst.UDPMaxFlows = *p.UDP.MaxFlows
+	}
 	return dst
 }
 

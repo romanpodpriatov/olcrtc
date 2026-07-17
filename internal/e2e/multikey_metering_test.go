@@ -214,3 +214,100 @@ func TestMultiKeyUnknownKeyNeverPairsFullStack(t *testing.T) {
 		t.Fatalf("outsider traffic was metered: %+v", stats)
 	}
 }
+
+// TestMultiKeyUDPDatagramMetersByPinnedKeyFullStack proves the ProofKit fork's
+// UDP metering contract end-to-end: a client presenting the SECOND ring key
+// opens a SOCKS5 UDP ASSOCIATE, a datagram round-trips through the multiplexed
+// vp8channel datagram path, and the relayed UDP bytes are attributed to that
+// client's pinned key id on /stats (never the shared entry-0 key). This is the
+// UDP analogue of TestMultiKeySecondRingKeyMetersFullStack and the money-path
+// guard for metering calls/games by the already-pinned key.
+func TestMultiKeyUDPDatagramMetersByPinnedKeyFullStack(t *testing.T) {
+	echoAddr := startUDPEchoServer(t)
+	carrierName, room := registerMemoryCarrier(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	statsAddr := freeLocalAddr(ctx, t)
+	socksAddr := freeLocalAddr(ctx, t)
+	const transportName = transportVP8
+	opts := e2eTransportOptions(transportName)
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- server.Run(ctx, server.Config{
+			Transport:        transportName,
+			TransportOptions: opts,
+			Carrier:          carrierName,
+			RoomURL:          testRoom,
+			// altKeyHex is entry 1: a correct pairing trial-decrypts past
+			// entry 0, and the datagram path must reuse that same pin.
+			Keys:        []string{testKeyHex, altKeyHex},
+			StatsListen: statsAddr,
+			DNSServer:   localDNSServer,
+			// Reach the loopback echo server (SSRF guard blocks private
+			// targets by default).
+			UnsafeAllowPrivateUDPTargets: true,
+		})
+	}()
+	room.waitConnected(t, 1)
+
+	ready := make(chan struct{})
+	clientErr := make(chan error, 1)
+	go func() {
+		clientErr <- client.RunWithReady(ctx, client.Config{
+			Transport:        transportName,
+			TransportOptions: opts,
+			Carrier:          carrierName,
+			RoomURL:          testRoom,
+			KeyHex:           altKeyHex,
+			DeviceID:         "udp-multikey-client",
+			LocalAddr:        socksAddr,
+			DNSServer:        localDNSServer,
+		}, func() { close(ready) })
+	}()
+	waitForReadyWithin(t, ready, 30*time.Second)
+
+	udpConn, tcpConn, relayAddr := connectViaSOCKSUDP(t, socksAddr)
+	payload := []byte("olcrtc-udp-multikey")
+	packet := buildSocksUDPPacket(t, echoAddr, payload)
+	if _, err := udpConn.WriteToUDP(packet, relayAddr); err != nil {
+		t.Fatalf("write socks udp packet: %v", err)
+	}
+	if err := udpConn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set udp read deadline: %v", err)
+	}
+	buf := make([]byte, 4096)
+	n, _, err := udpConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("read socks udp echo: %v", err)
+	}
+	if _, got := parseSocksUDPPacket(t, buf[:n]); !bytes.Equal(got, payload) {
+		t.Fatalf("udp echo = %q, want %q", got, payload)
+	}
+
+	// Metering fires when the UDP flow closes; tearing down the association
+	// (close the SOCKS control conn) sends flow-close frames to the srv.
+	_ = udpConn.Close()
+	_ = tcpConn.Close()
+
+	wantID := keyID(t, altKeyHex)
+	otherID := keyID(t, testKeyHex)
+	deadline := time.Now().Add(15 * time.Second)
+	var stats server.StatsBody
+	for time.Now().Before(deadline) {
+		stats = fetchStats(t, statsAddr)
+		if d, ok := stats.Keys[wantID]; ok && d.Up > 0 && d.Down > 0 {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	d, ok := stats.Keys[wantID]
+	if !ok || d.Up == 0 || d.Down == 0 {
+		t.Fatalf("UDP flow not metered to pinned key %s: stats=%+v", wantID, stats)
+	}
+	if _, leaked := stats.Keys[otherID]; leaked {
+		t.Fatalf("UDP bytes leaked onto unpaired ring key %s: %+v", otherID, stats)
+	}
+	t.Logf("metered UDP on pinned key %s: up=%d down=%d", wantID, d.Up, d.Down)
+}

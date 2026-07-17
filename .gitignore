@@ -255,3 +255,6 @@ cpu.prof
 .kirograph
 package.json
 package-lock.json
+olcrtc-udp-spike
+olcrtc-udp-spike-dbg
+olcrtc-metering-amd64

@@ -35,6 +35,8 @@ type Config struct {
 	Name                string
 	OnData              func([]byte)
 	OnPeerData          func(peerID string, data []byte)
+	OnDatagram          func([]byte)
+	OnPeerDatagram      func(peerID string, data []byte)
 	DNSServer           string
 	ProxyAddr           string
 	ProxyPort           int
@@ -101,6 +103,8 @@ func registerDirect(name string) {
 			Name:                cfg.Name,
 			OnData:              cfg.OnData,
 			OnPeerData:          cfg.OnPeerData,
+			OnDatagram:          cfg.OnDatagram,
+			OnPeerDatagram:      cfg.OnPeerDatagram,
 			DNSServer:           cfg.DNSServer,
 			ProxyAddr:           cfg.ProxyAddr,
 			ProxyPort:           cfg.ProxyPort,
@@ -136,6 +140,8 @@ func registerEngineAuth(name string, provider auth.Provider) {
 			Extra:               creds.Extra,
 			OnData:              cfg.OnData,
 			OnPeerData:          cfg.OnPeerData,
+			OnDatagram:          cfg.OnDatagram,
+			OnPeerDatagram:      cfg.OnPeerDatagram,
 			DNSServer:           cfg.DNSServer,
 			ProxyAddr:           cfg.ProxyAddr,
 			ProxyPort:           cfg.ProxyPort,
