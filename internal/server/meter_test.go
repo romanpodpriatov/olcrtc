@@ -17,13 +17,13 @@ func TestMeterAttributesPerKeyAndTotals(t *testing.T) {
 	m.add("unbound-session", 999, 999) // no bound key → ignored
 
 	snap := m.snapshot()
-	if snap.Keys["keyaaa0000000000"] != (statsDirection{Up: 110, Down: 220}) {
+	if snap.Keys["keyaaa0000000000"] != (StatsDirection{Up: 110, Down: 220}) {
 		t.Fatalf("key A = %+v", snap.Keys["keyaaa0000000000"])
 	}
-	if snap.Keys["keybbb0000000000"] != (statsDirection{Up: 1, Down: 2}) {
+	if snap.Keys["keybbb0000000000"] != (StatsDirection{Up: 1, Down: 2}) {
 		t.Fatalf("key B = %+v", snap.Keys["keybbb0000000000"])
 	}
-	if snap.Total != (statsDirection{Up: 111, Down: 222}) {
+	if snap.Total != (StatsDirection{Up: 111, Down: 222}) {
 		t.Fatalf("total = %+v", snap.Total)
 	}
 	if len(snap.Keys) != 2 {
@@ -52,7 +52,7 @@ func TestStatsHandlerServesContractJSON(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("status %d", rec.Code)
 	}
-	var body statsResponse
+	var body StatsBody
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("bad json: %v (%s)", err, rec.Body.String())
 	}

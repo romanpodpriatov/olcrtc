@@ -67,25 +67,26 @@ func (m *meter) add(sessionID string, up, down uint64) {
 	m.mu.Unlock()
 }
 
-// statsDirection is one {up,down} pair in the /stats JSON.
-type statsDirection struct {
+// StatsDirection is one {up,down} pair in the /stats JSON. Exported so the
+// agent (and integration tests) can decode the endpoint without redefining it.
+type StatsDirection struct {
 	Up   uint64 `json:"up"`
 	Down uint64 `json:"down"`
 }
 
-// statsResponse is the /stats body: per-key totals plus a grand total.
-type statsResponse struct {
-	Keys  map[string]statsDirection `json:"keys"`
-	Total statsDirection            `json:"total"`
+// StatsBody is the /stats response: per-key totals plus a grand total.
+type StatsBody struct {
+	Keys  map[string]StatsDirection `json:"keys"`
+	Total StatsDirection            `json:"total"`
 }
 
 // snapshot copies the current counters for serialization.
-func (m *meter) snapshot() statsResponse {
+func (m *meter) snapshot() StatsBody {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	resp := statsResponse{Keys: make(map[string]statsDirection, len(m.perKey))}
+	resp := StatsBody{Keys: make(map[string]StatsDirection, len(m.perKey))}
 	for keyID, c := range m.perKey {
-		resp.Keys[keyID] = statsDirection{Up: c.up, Down: c.down}
+		resp.Keys[keyID] = StatsDirection{Up: c.up, Down: c.down}
 		resp.Total.Up += c.up
 		resp.Total.Down += c.down
 	}
