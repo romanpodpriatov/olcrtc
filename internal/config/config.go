@@ -49,6 +49,7 @@ type File struct {
 	Gen       Gen       `yaml:"gen"`
 	Profiles  []Profile `yaml:"profiles"`
 	Failover  Failover  `yaml:"failover"`
+	Stats     Stats     `yaml:"stats"`
 	Data      string    `yaml:"data"`
 	Debug     bool      `yaml:"debug"`
 }
@@ -88,10 +89,19 @@ type Room struct {
 	Channel string `yaml:"channel"`
 }
 
-// Crypto holds the shared secret used to authenticate and encrypt the tunnel.
+// Crypto holds the shared secret(s) used to authenticate and encrypt the tunnel.
 type Crypto struct {
 	Key     string `yaml:"key"`      // 64-char hex (32 bytes)
 	KeyFile string `yaml:"key_file"` // path to a file containing crypto.key
+	// Keys is the ProofKit multi-key ring: each entry is a 64-hex key a
+	// client may hold. When non-empty the srv accepts a peer under ANY
+	// listed key and meters its traffic per key. Empty ⇒ single `key`.
+	Keys []string `yaml:"keys"`
+}
+
+// Stats configures the ProofKit per-key metering endpoint.
+type Stats struct {
+	Listen string `yaml:"listen"` // loopback addr, e.g. "127.0.0.1:9464"; empty disables
 }
 
 // Net groups network and transport selection.
@@ -258,6 +268,8 @@ func Apply(dst session.Config, f File) session.Config {
 	dst.RoomID = pickString(dst.RoomID, f.Room.ID)
 	dst.ChannelID = pickString(dst.ChannelID, f.Room.Channel)
 	dst.KeyHex = pickString(dst.KeyHex, f.Crypto.Key)
+	dst.KeysHex = pickStrings(dst.KeysHex, f.Crypto.Keys)
+	dst.StatsListen = pickString(dst.StatsListen, f.Stats.Listen)
 	dst.SOCKSHost = pickString(dst.SOCKSHost, f.SOCKS.Host)
 	dst.SOCKSPort = pickInt(dst.SOCKSPort, f.SOCKS.Port)
 	dst.SOCKSUser = pickString(dst.SOCKSUser, f.SOCKS.User)
@@ -350,6 +362,13 @@ func pickString(cli, yamlVal string) string {
 
 func pickInt(cli, yamlVal int) int {
 	if cli != 0 {
+		return cli
+	}
+	return yamlVal
+}
+
+func pickStrings(cli, yamlVal []string) []string {
+	if len(cli) != 0 {
 		return cli
 	}
 	return yamlVal

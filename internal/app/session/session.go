@@ -183,6 +183,8 @@ type Config struct {
 	RoomID                string
 	ChannelID             string
 	KeyHex                string
+	KeysHex               []string
+	StatsListen           string
 	SOCKSHost             string
 	SOCKSPort             int
 	SOCKSUser             string
@@ -385,7 +387,9 @@ func validateCommon(cfg Config) error {
 	if cfg.RoomID == "" && cfg.Auth != authNone {
 		return ErrRoomIDRequired
 	}
-	if cfg.KeyHex == "" {
+	// A key is required: either the single KeyHex or the ProofKit multi-key
+	// ring (KeysHex). The client always uses KeyHex; a srv may use either.
+	if cfg.KeyHex == "" && len(cfg.KeysHex) == 0 {
 		return ErrKeyRequired
 	}
 	if cfg.DNSServer == "" {
@@ -652,6 +656,8 @@ func runOnce(
 			RoomURL:          roomURL,
 			ChannelID:        cfg.ChannelID,
 			KeyHex:           cfg.KeyHex,
+			Keys:             cfg.KeysHex,
+			StatsListen:      cfg.StatsListen,
 			DNSServer:        cfg.DNSServer,
 			SOCKSProxyAddr:   cfg.SOCKSProxyAddr,
 			SOCKSProxyPort:   cfg.SOCKSProxyPort,

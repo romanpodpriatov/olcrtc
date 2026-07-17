@@ -246,7 +246,7 @@ func TestShutdownClosesLinkAndConn(t *testing.T) {
 	ln := &serverLinkStub{}
 	s := &Server{
 		ln:     ln,
-		cipher: cipher,
+		ring: cryptopkg.Single(cipher, ""),
 		conn:   muxconn.New(ln, cipher),
 	}
 	s.shutdown()
@@ -385,7 +385,7 @@ func TestReinstallSessionFiresOnClose(t *testing.T) {
 	}
 	s := &Server{
 		ln:        &serverLinkStub{},
-		cipher:    cipher,
+		ring: cryptopkg.Single(cipher, ""),
 		sessionID: "sid-123",
 		deviceID:  "dev-123",
 		onClose:   func(sid, reason string) { got.sid = sid; got.reason = reason },
@@ -515,7 +515,7 @@ func TestStartControlLoopResetsPeerBeforeReinstall(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
 		ln:      ln,
-		cipher:  cipher,
+		ring: cryptopkg.Single(cipher, ""),
 		conn:    muxconn.New(ln, cipher),
 		session: serverSess,
 		health:  runtime.NewHealthTracker(nil),
@@ -687,7 +687,7 @@ func TestReinstallSessionClosesOldConnBeforeSwap(t *testing.T) {
 	}
 	s := &Server{
 		ln:           ln,
-		cipher:       cipher,
+		ring: cryptopkg.Single(cipher, ""),
 		conn:         conn,
 		session:      sess,
 		onClose:      func(string, string) {},

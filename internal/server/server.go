@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -65,8 +66,16 @@ type Server struct {
 	baseCtx context.Context //nolint:containedctx // server-lifetime ctx for reconnect goroutines
 	ln      transport.Transport
 	peerLn  transport.PeerTransport
-	cipher  *crypto.Cipher
-	conn    *muxconn.Conn
+	// ring is the candidate key set for multi-key pairing (ProofKit fork).
+	// A stock single-key config yields a one-entry ring, reproducing the
+	// legacy single-cipher behavior exactly.
+	ring *crypto.Ring
+	// group is the current single-link pairing generation (data + control
+	// conns share it). A fresh group is minted on every (re)install so a
+	// reconnecting client may return under a different key. Unused in
+	// per-peer (SFU) mode, where each peerSession carries its own group.
+	group *muxconn.PinGroup
+	conn  *muxconn.Conn
 	// controlConn is wired to the transport's isolated control-plane channel
 	// (transport.ControlPlane). When non-nil, the smux control session runs
 	// over it so bulk data writes never block control ping/pong.
@@ -103,6 +112,9 @@ type Server struct {
 	health         *runtime.HealthTracker
 	done           chan struct{}
 	doneOnce       sync.Once
+	// meter accumulates per-key traffic for the /stats endpoint (ProofKit
+	// fork). Always non-nil; inert when no key ids are bound.
+	meter *meter
 }
 
 // peerStat holds the per-session info needed to report the live peer count
@@ -122,6 +134,10 @@ type peerSession struct {
 	controlStop context.CancelFunc
 	sessionID   string
 	deviceID    string
+	// group is this peer's pairing state — the control conn pins it on
+	// CLIENT_HELLO and the data conn (created later) inherits the pin, so
+	// per-peer metering can read the paired key id (ProofKit fork).
+	group *muxconn.PinGroup
 	// sessionReady is closed once sessionID is populated from acceptHandshake.
 	sessionReady chan struct{}
 }
@@ -140,6 +156,10 @@ type Config struct {
 	RoomURL          string
 	ChannelID        string
 	KeyHex           string
+	// Keys is the ProofKit multi-key ring (64-hex each). When non-empty it
+	// supersedes KeyHex: the srv accepts a peer holding ANY listed key and
+	// attributes its traffic to that key's id. Empty ⇒ single-key (KeyHex).
+	Keys             []string
 	DNSServer        string
 	SOCKSProxyAddr   string
 	SOCKSProxyPort   int
@@ -152,6 +172,10 @@ type Config struct {
 	AuthToken        string
 	Liveness         control.Config
 	Traffic          transport.TrafficConfig
+	// StatsListen, when non-empty, starts a loopback HTTP server exposing
+	// GET /stats with per-key byte totals (ProofKit metering fork). Should
+	// always be a loopback address, e.g. "127.0.0.1:9464".
+	StatsListen string
 
 	// AuthHook is invoked after CLIENT_HELLO to authorize the client and
 	// return a session ID. If nil, every client is admitted with a random UUID.
@@ -172,9 +196,9 @@ func Run(ctx context.Context, cfg Config) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	cipher, err := setupCipher(cfg.KeyHex)
+	ring, err := setupRing(cfg)
 	if err != nil {
-		return fmt.Errorf("setupCipher failed: %w", err)
+		return fmt.Errorf("setupRing failed: %w", err)
 	}
 
 	hook := cfg.AuthHook
@@ -194,7 +218,7 @@ func Run(ctx context.Context, cfg Config) error {
 		onTraffic = func(string, string, uint64, uint64) {}
 	}
 	s := &Server{
-		cipher:         cipher,
+		ring:           ring,
 		authHook:       hook,
 		onOpen:         onOpen,
 		onClose:        onClose,
@@ -209,8 +233,30 @@ func Run(ctx context.Context, cfg Config) error {
 		peerSessions:   make(map[string]*peerSession),
 		peerStats:      make(map[string]peerStat),
 		done:           make(chan struct{}),
+		meter:          newMeter(),
 	}
 	s.setupResolver()
+
+	// ProofKit metering: expose per-key byte totals on a loopback endpoint
+	// the agent polls. Best-effort — a bind failure logs and leaves metering
+	// in-memory only, never blocking the tunnel.
+	if cfg.StatsListen != "" {
+		statsSrv := &http.Server{
+			Addr:              cfg.StatsListen,
+			Handler:           s.meter.statsHandler(),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			logger.Infof("stats: serving /stats on %s", cfg.StatsListen)
+			if err := statsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Warnf("stats: server on %s stopped: %v", cfg.StatsListen, err)
+			}
+		}()
+		go func() {
+			<-runCtx.Done()
+			_ = statsSrv.Close()
+		}()
+	}
 
 	// Register shutdown BEFORE bringUpLink so a partial setup (e.g.
 	// link.New succeeded but ln.Connect timed out) still tears the
@@ -238,12 +284,34 @@ func Run(ctx context.Context, cfg Config) error {
 	return nil
 }
 
+// setupCipher validates and builds a single cipher from a 64-hex key.
+// Retained for the single-key validation path and its tests.
 func setupCipher(keyHex string) (*crypto.Cipher, error) {
 	cipher, err := runtime.SetupCipher(keyHex)
 	if err != nil {
 		return nil, fmt.Errorf("server: %w", err)
 	}
 	return cipher, nil
+}
+
+// setupRing builds the candidate key ring. cfg.Keys (ProofKit multi-key
+// fork) takes precedence; an empty Keys falls back to the single cfg.KeyHex,
+// so a stock config yields a one-entry ring identical to legacy behavior.
+// Every key is validated as 64-hex/32-byte via crypto.NewRing.
+func setupRing(cfg Config) (*crypto.Ring, error) {
+	keys := cfg.Keys
+	if len(keys) == 0 {
+		// Reuse the strict single-key validation for parity with the old path.
+		if _, err := setupCipher(cfg.KeyHex); err != nil {
+			return nil, err
+		}
+		keys = []string{cfg.KeyHex}
+	}
+	ring, err := crypto.NewRing(keys)
+	if err != nil {
+		return nil, fmt.Errorf("server: build key ring: %w", err)
+	}
+	return ring, nil
 }
 
 func (s *Server) setupResolver() {
@@ -351,7 +419,11 @@ func (s *Server) bringUpLink(
 }
 
 func (s *Server) installSession() {
-	conn := muxconn.New(s.ln, s.cipher)
+	// One pairing generation for this single-link session: the data and
+	// control conns share it, so whichever sees the client's first frame
+	// pins the key for both.
+	group := muxconn.NewPinGroup(s.ring)
+	conn := muxconn.NewGrouped(s.ln, group)
 	sess, err := smux.Server(conn, dataSmuxConfig(s.ln))
 	if err != nil {
 		logger.Warnf("smux server init failed: %v", err)
@@ -361,7 +433,7 @@ func (s *Server) installSession() {
 	// control smux session over it and launch the handshake acceptor.
 	// For transports without a control plane, serveSingle drives the
 	// handshake in its own loop.
-	controlConn := muxconn.NewControl(s.ln, s.cipher)
+	controlConn := muxconn.NewControlGrouped(s.ln, group)
 	var ctrlSess *smux.Session
 	if controlConn != nil {
 		controlSess, cerr := smux.Server(controlConn, controlSmuxConfig(linkMaxPayload(s.ln)))
@@ -376,6 +448,7 @@ func (s *Server) installSession() {
 		}
 	}
 	s.sessMu.Lock()
+	s.group = group
 	s.conn = conn
 	s.controlConn = controlConn
 	s.controlSess = ctrlSess
@@ -397,8 +470,13 @@ func (s *Server) installControlSession() {
 		s.installPeerControlPlane(pcp)
 		return
 	}
-	// Fallback: singleton control plane (ControlPlane only).
-	controlConn := muxconn.NewControl(s.ln, s.cipher)
+	// Fallback: singleton control plane (ControlPlane only). Multi-key
+	// pairing degrades gracefully here — a single shared control conn can
+	// only pin one key, so this rare peer-routing-without-PeerControlPlane
+	// transport meters all peers under the first key seen; single-key is
+	// unaffected. Real SFU transports take the PeerControlPlane path above.
+	group := muxconn.NewPinGroup(s.ring)
+	controlConn := muxconn.NewControlGrouped(s.ln, group)
 	if controlConn == nil {
 		return
 	}
@@ -409,6 +487,7 @@ func (s *Server) installControlSession() {
 		return
 	}
 	s.sessMu.Lock()
+	s.group = group
 	s.controlConn = controlConn
 	s.controlSess = controlSess
 	s.sessMu.Unlock()
@@ -452,7 +531,10 @@ func (s *Server) getOrCreatePeerControlSession(peerID string) *peerSession {
 		return nil
 	}
 
-	controlConn := muxconn.NewPeerControl(s.ln, s.cipher, peerID)
+	// Fresh pairing group for this peer; the data conn (getPeerSession)
+	// inherits it via ps.group so both planes pin the same key.
+	group := muxconn.NewPinGroup(s.ring)
+	controlConn := muxconn.NewPeerControlGrouped(s.ln, group, peerID)
 	if controlConn == nil {
 		s.sessMu.Unlock()
 		return nil
@@ -468,6 +550,7 @@ func (s *Server) getOrCreatePeerControlSession(peerID string) *peerSession {
 		peerID:       peerID,
 		controlConn:  controlConn,
 		controlSess:  controlSess,
+		group:        group,
 		sessionReady: make(chan struct{}),
 	}
 	s.peerSessions[peerID] = ps
@@ -533,13 +616,16 @@ type replacementSession struct {
 	sess        *smux.Session
 	controlConn *muxconn.Conn
 	controlSess *smux.Session
+	group       *muxconn.PinGroup
 }
 
 // buildReplacementSession constructs a fresh data + (optional) control smux
 // session over new muxconns. It returns nil when the data session could not be
-// built.
+// built. A reconnecting client re-runs the handshake, so a fresh pairing
+// group is minted here — the peer may return holding a different key.
 func (s *Server) buildReplacementSession() *replacementSession {
-	conn := muxconn.New(s.ln, s.cipher)
+	group := muxconn.NewPinGroup(s.ring)
+	conn := muxconn.NewGrouped(s.ln, group)
 	sess, err := smux.Server(conn, dataSmuxConfig(s.ln))
 	if err != nil {
 		logger.Warnf("smux server init failed: %v", err)
@@ -547,8 +633,8 @@ func (s *Server) buildReplacementSession() *replacementSession {
 		return nil
 	}
 
-	r := &replacementSession{conn: conn, sess: sess}
-	r.controlConn = muxconn.NewControl(s.ln, s.cipher)
+	r := &replacementSession{conn: conn, sess: sess, group: group}
+	r.controlConn = muxconn.NewControlGrouped(s.ln, group)
 	if r.controlConn != nil {
 		r.controlSess, err = smux.Server(r.controlConn, controlSmuxConfig(linkMaxPayload(s.ln)))
 		if err != nil {
@@ -604,6 +690,7 @@ func (s *Server) swapSession(dead *smux.Session, r *replacementSession) bool {
 	s.conn = r.conn
 	s.controlConn = r.controlConn
 	s.controlSess = r.controlSess
+	s.group = r.group
 	s.controlStrm = nil
 	s.controlStop = nil
 	s.sessionID = ""
@@ -798,8 +885,17 @@ func (s *Server) getPeerSession(peerID string) *peerSession {
 		s.sessMu.Unlock()
 		return ps
 	}
+	// The data conn shares the peer's pairing group: it was minted by the
+	// control session (common case) and already pinned by CLIENT_HELLO, or
+	// is fresh here in the no-PeerControlPlane path.
+	var pinGroup *muxconn.PinGroup
+	if ps != nil && ps.group != nil {
+		pinGroup = ps.group
+	} else {
+		pinGroup = muxconn.NewPinGroup(s.ring)
+	}
 	// Build the data smux session for this peer.
-	conn := muxconn.NewPeer(s.peerLn, s.cipher, peerID)
+	conn := muxconn.NewPeerGrouped(s.peerLn, pinGroup, peerID)
 	sess, err := smux.Server(conn, dataSmuxConfig(s.ln))
 	if err != nil {
 		s.sessMu.Unlock()
@@ -823,6 +919,7 @@ func (s *Server) getPeerSession(peerID string) *peerSession {
 			peerID:  peerID,
 			conn:    conn,
 			session: sess,
+			group:   pinGroup,
 		}
 		s.peerSessions[peerID] = ps
 		s.sessMu.Unlock()
@@ -1001,6 +1098,9 @@ func (s *Server) acceptHandshake(ctx context.Context, sess *smux.Session) bool {
 		s.sessionID = sid
 		s.sessMu.Unlock()
 		s.recordSession(sid)
+		if s.group != nil {
+				s.meter.bind(sid, s.group.KeyID())
+		}
 		s.onOpen(sid, hello.DeviceID, hello.Claims)
 		s.trackPeerOpen(sid, hello.DeviceID)
 		logger.Infof("session %s opened (device=%s)", sid, hello.DeviceID)
@@ -1050,6 +1150,9 @@ func (s *Server) acceptPeerHandshake(ctx context.Context, ps *peerSession) {
 			close(ps.sessionReady)
 		}
 		s.recordSession(sid)
+		if s.meter != nil && ps.group != nil {
+			s.meter.bind(sid, ps.group.KeyID())
+		}
 		s.onOpen(sid, hello.DeviceID, hello.Claims)
 		s.trackPeerOpen(sid, hello.DeviceID)
 		logger.Infof("peer session %s opened (peer=%s device=%s)", sid, ps.peerID, hello.DeviceID)
@@ -1373,6 +1476,11 @@ func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest, sessionID str
 	bytesIn := uint64(0)
 	if in > 0 {
 		bytesIn = uint64(in)
+	}
+	// ProofKit metering: attribute this stream's bytes to the session's key
+	// (up = client→internet = bytesIn, down = internet→client = bytesOut).
+	if s.meter != nil {
+		s.meter.add(sessionID, bytesIn, bytesOut)
 	}
 	if s.onTraffic != nil {
 		s.onTraffic(sessionID, addr, bytesIn, bytesOut)

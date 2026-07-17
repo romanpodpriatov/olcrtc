@@ -55,7 +55,7 @@ func TestSwapSessionAcceptsControlSessionInPeerRouting(t *testing.T) {
 	ln := &peerRoutingStub{}
 	s := &Server{
 		ln:          ln,
-		cipher:      cipher,
+		ring: cryptopkg.Single(cipher, ""),
 		session:     nil, // peer-routing: data session is nil
 		controlSess: deadControl,
 		health:      runtime.NewHealthTracker(nil),
@@ -102,7 +102,7 @@ func TestSwapSessionDiscardsStaleReinstall(t *testing.T) {
 	ln := &peerRoutingStub{}
 	s := &Server{
 		ln:      ln,
-		cipher:  cipher,
+		ring: cryptopkg.Single(cipher, ""),
 		session: liveData,
 		health:  runtime.NewHealthTracker(nil),
 	}
