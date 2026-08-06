@@ -196,7 +196,10 @@ func (s *Server) dialUDPFlow(target udpDialTarget) (net.Conn, error) {
 func (s *Server) socks5UDPAssociate(endpoint udpwire.Endpoint) (net.Conn, error) {
 	proxyAddr := net.JoinHostPort(s.socksProxyAddr, strconv.Itoa(s.socksProxyPort))
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	tcpConn, err := dialer.DialContext(s.udpBaseCtx(), "tcp4", proxyAddr)
+	// ai-generated: "tcp4" -> "tcp" (#1). The proxy address is operator
+	// configuration and may be an IPv6 literal; the UDP side above already
+	// picks its family from the resolved address.
+	tcpConn, err := dialer.DialContext(s.udpBaseCtx(), "tcp", proxyAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial udp proxy: %w", err)
 	}

@@ -23,6 +23,7 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
 	"github.com/openlibrecommunity/olcrtc/internal/names"
+	"github.com/openlibrecommunity/olcrtc/internal/protect"
 	"github.com/openlibrecommunity/olcrtc/internal/runtime"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 	"github.com/xtaci/smux"
@@ -330,14 +331,11 @@ func setupRing(cfg Config) (*crypto.Ring, error) {
 	return ring, nil
 }
 
+// ai-generated: body rewritten for the IPv6-only carrier-auth fix (#1). Same
+// single-server, unprotected resolver the session used to build; see
+// internal/protect/resolver.go.
 func (s *Server) setupResolver() {
-	s.resolver = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 3 * time.Second}
-			return d.DialContext(ctx, network, s.dnsServer)
-		},
-	}
+	s.resolver = protect.NewResolver(s.dnsServer)
 }
 
 // dataSmuxConfig returns the data-plane smux config for the server's
@@ -1527,7 +1525,8 @@ func (s *Server) dial(req ConnectRequest) (net.Conn, error) {
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
-	conn, err := dialer.Dial("tcp4", proxyAddr)
+	// ai-generated: "tcp4" -> "tcp" (#1), same reason as internal/server/udp.go.
+	conn, err := dialer.Dial("tcp", proxyAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial proxy: %w", err)
 	}
