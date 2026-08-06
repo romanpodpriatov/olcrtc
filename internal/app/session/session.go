@@ -16,6 +16,7 @@ import (
 	enginebuiltin "github.com/openlibrecommunity/olcrtc/internal/engine/builtin"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/names"
+	"github.com/openlibrecommunity/olcrtc/internal/protect"
 	"github.com/openlibrecommunity/olcrtc/internal/runtime"
 	"github.com/openlibrecommunity/olcrtc/internal/server"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
@@ -641,17 +642,19 @@ func Run(ctx context.Context, cfg Config) error {
 	return run(ctx)
 }
 
+// configureDefaultResolver points name resolution at the configured DNS server.
+//
+// ai-generated: body rewritten for the IPv6-only carrier-auth fix (#1). The
+// resolver used to dial the configured server and nothing else, over an
+// unprotected socket. net.dns is a single IPv4 literal on every mobile client,
+// so on a link without IPv4 it was unreachable and resolution ended there -
+// which is every session on an IPv6-only carrier.
 func configureDefaultResolver(dnsServer string) {
 	if dnsServer == "" {
 		return
 	}
-	net.DefaultResolver = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 3 * time.Second}
-			return d.DialContext(ctx, network, dnsServer)
-		},
-	}
+	protect.SetDNSServers(dnsServer)
+	net.DefaultResolver = protect.NewResolver(dnsServer)
 }
 
 func runOnce(

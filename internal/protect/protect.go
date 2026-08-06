@@ -40,6 +40,14 @@ var (
 // On Android, this calls VpnService.protect(fd) to bypass VPN routing.
 var Protector func(fd int) bool //nolint:gochecknoglobals // package-level state intentional
 
+// ErrProtectorRejected reports that the host protector refused a socket.
+//
+// This used to surface as net.ErrClosed, which prints "use of closed network
+// connection" - a protector that fails only for AF_INET6 then reads as an
+// unrelated bug in whatever was dialing. The network is in the OpError, so the
+// message now names both the cause and the family it happened on.
+var ErrProtectorRejected = errors.New("socket protector rejected the socket")
+
 func controlFunc(network, _ string, c syscall.RawConn) error {
 	if Protector == nil {
 		return nil
@@ -47,7 +55,7 @@ func controlFunc(network, _ string, c syscall.RawConn) error {
 	var err error
 	controlErr := c.Control(func(fd uintptr) {
 		if !Protector(int(fd)) {
-			err = &net.OpError{Op: "protect", Net: network, Err: net.ErrClosed}
+			err = &net.OpError{Op: "protect", Net: network, Err: ErrProtectorRejected}
 		}
 	})
 	if controlErr != nil {
@@ -56,12 +64,14 @@ func controlFunc(network, _ string, c syscall.RawConn) error {
 	return err
 }
 
-// NewDialer returns a net.Dialer that calls Protector on each new socket.
+// NewDialer returns a net.Dialer that calls Protector on each new socket and
+// resolves through the configured DNS servers.
 func NewDialer() *net.Dialer {
 	return &net.Dialer{
 		Timeout:   defaultDialTimeout,
 		KeepAlive: defaultKeepAlive,
 		Control:   controlFunc,
+		Resolver:  activeResolver(),
 	}
 }
 
@@ -72,10 +82,9 @@ func NewTLSConfig() *tls.Config {
 
 // NewHTTPTransport returns an HTTP transport using protected sockets and sane timeouts.
 func NewHTTPTransport() *http.Transport {
-	dialer := NewDialer()
 	return &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           dialer.DialContext,
+		DialContext:           DialContext,
 		TLSClientConfig:       NewTLSConfig(),
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          10,
@@ -168,7 +177,19 @@ func RedactSensitive(text string) string {
 }
 
 // DialContext dials using a protected socket.
+//
+// For "tcp" against a host name it resolves both address families and tries
+// both. A plain net.Dialer races them only when both families reach it, and a
+// single dropped AAAA is enough for them not to - which on a link with no IPv4
+// leaves an immediate ENETUNREACH as the only outcome (#1).
 func DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if network == "tcp" && !isIPLiteral(address) {
+		conn, err := dialDualStack(ctx, address)
+		if err != nil {
+			return nil, fmt.Errorf("dial failed: %w", err)
+		}
+		return conn, nil
+	}
 	conn, err := NewDialer().DialContext(ctx, network, address)
 	if err != nil {
 		return nil, fmt.Errorf("dial failed: %w", err)
@@ -176,16 +197,21 @@ func DialContext(ctx context.Context, network, address string) (net.Conn, error)
 	return conn, nil
 }
 
+// isIPLiteral reports whether address is a host:port whose host is an IP.
+func isIPLiteral(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return false
+	}
+	return net.ParseIP(host) != nil
+}
+
 // ProxyDialer implements golang.org/x/net/proxy.Dialer for pion ICE.
 type ProxyDialer struct{}
 
 // Dial connects to the address on the named network using a protected socket.
 func (d *ProxyDialer) Dial(network, addr string) (net.Conn, error) {
-	conn, err := NewDialer().Dial(network, addr)
-	if err != nil {
-		return nil, fmt.Errorf("dial failed: %w", err)
-	}
-	return conn, nil
+	return DialContext(context.Background(), network, addr)
 }
 
 // NewProxyDialer returns a proxy.Dialer that protects ICE sockets.
