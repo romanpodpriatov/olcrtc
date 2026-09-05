@@ -134,6 +134,14 @@ func isRetriableError(err error) bool {
 	if errors.As(err, &dnsErr) {
 		return true
 	}
+	// No route is a statement about this instant, not about the host: the
+	// link is still coming up, the phone is mid-handover, or the socket was
+	// pinned to an interface that had nothing behind it. It used to be the one
+	// dial error that ended the request on the first try, which on a mobile
+	// carrier is the difference between connecting and not.
+	if errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) {
+		return true
+	}
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
 		return opErr.Timeout() || strings.Contains(opErr.Error(), "connection refused")

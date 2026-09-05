@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -194,3 +195,31 @@ func TestDialFailuresAreWrapped(t *testing.T) {
 }
 
 var _ syscall.RawConn = rawConnStub{}
+
+// A socket that has no route is a socket on a link that is still coming up,
+// mid-handover, or bound to the wrong interface for a moment - none of which
+// says anything about the next attempt. This used to end the request on the
+// first try: every other dial error retried, the unreachable ones did not.
+func TestUnreachableDialIsRetriable(t *testing.T) {
+	leg := func(ip string, errno syscall.Errno) error {
+		return &net.OpError{
+			Op: "dial", Net: "tcp",
+			Addr: &net.TCPAddr{IP: net.ParseIP(ip), Port: 443},
+			Err:  &net.OpError{Op: "connect", Err: errno},
+		}
+	}
+	cases := map[string]error{
+		"host unreachable on both families": fmt.Errorf("dial failed: %w", &familyDialError{
+			address: "cloud-api.yandex.ru:443",
+			ipv6:    leg("2a02:6b8::1:127", syscall.EHOSTUNREACH),
+			ipv4:    leg("213.180.204.127", syscall.EHOSTUNREACH),
+		}),
+		"network unreachable on a single family": fmt.Errorf("dial failed: %w",
+			leg("213.180.204.127", syscall.ENETUNREACH)),
+	}
+	for name, err := range cases {
+		if !isRetriableError(err) {
+			t.Errorf("%s: isRetriableError() = false, want true for %v", name, err)
+		}
+	}
+}
