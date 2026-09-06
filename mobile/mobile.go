@@ -581,6 +581,16 @@ func startWithConfig(
 
 	roomURL := buildRoomURL(carrierName, roomID)
 
+	// The resolver the protected dialers use, pointed at the same server the
+	// client is handed. This used to stop at the client config, so every name
+	// the carrier needed was looked up through the system resolver - which,
+	// inside an iOS packet tunnel, is the tunnel's own, and nothing serves it
+	// until the cores are up. A room on a self-hosted host, never in the
+	// phone's DNS cache, could not be resolved at all. Resolving over the
+	// protected sockets keeps the lookup on the physical interface, where the
+	// dial that follows it goes anyway.
+	protect.SetDNSServers(cfg.dnsServer)
+
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	cancel = cancelFunc
 	done = make(chan struct{})

@@ -107,8 +107,14 @@ func (n *ProtectedNet) ListenUDP(network string, locAddr *net.UDPAddr) (transpor
 }
 
 // Dial connects to the address on a protected socket.
+//
+// The name in it is resolved through the configured resolver, over protected
+// sockets, rather than the system one. These dialers used to carry only the
+// Control hook, so a TURN or signalling host went to the system resolver -
+// inside an iOS packet tunnel the tunnel's own, unserved until the cores are
+// up - and a host not already in the phone's cache came back "no such host".
 func (n *ProtectedNet) Dial(network, address string) (net.Conn, error) {
-	d := net.Dialer{Control: controlFunc}
+	d := net.Dialer{Control: controlFunc, Resolver: activeResolver()}
 	conn, err := d.Dial(network, address)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s %q: %w", network, address, err)
@@ -118,7 +124,7 @@ func (n *ProtectedNet) Dial(network, address string) (net.Conn, error) {
 
 // DialUDP connects to a UDP address on a protected socket.
 func (n *ProtectedNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transport.UDPConn, error) {
-	d := net.Dialer{Control: controlFunc}
+	d := net.Dialer{Control: controlFunc, Resolver: activeResolver()}
 	if laddr != nil {
 		d.LocalAddr = laddr
 	}
@@ -137,7 +143,7 @@ func (n *ProtectedNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (trans
 
 // DialTCP connects to a TCP address on a protected socket.
 func (n *ProtectedNet) DialTCP(network string, laddr, raddr *net.TCPAddr) (transport.TCPConn, error) {
-	d := net.Dialer{Control: controlFunc}
+	d := net.Dialer{Control: controlFunc, Resolver: activeResolver()}
 	if laddr != nil {
 		d.LocalAddr = laddr
 	}
@@ -181,6 +187,11 @@ func (n *ProtectedNet) CreateDialer(d *net.Dialer) transport.Dialer {
 		dialer.ControlContext = chainControlContext(dialer.ControlContext)
 	} else {
 		dialer.Control = chainControl(dialer.Control)
+	}
+	// Names resolve where the sockets are protected, not through the system
+	// resolver - see Dial. A resolver the caller chose is left alone.
+	if dialer.Resolver == nil {
+		dialer.Resolver = activeResolver()
 	}
 	return n.Net.CreateDialer(&dialer)
 }
