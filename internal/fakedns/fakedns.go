@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync/atomic"
 
 	"golang.org/x/net/dns/dnsmessage"
 )
@@ -16,6 +17,22 @@ type Server struct {
 	Addr    string
 	conn    net.PacketConn
 	records map[string]net.IP
+	queries atomic.Int64
+	silent  bool
+}
+
+// Queries is how many questions arrived, answered or not.
+func (s *Server) Queries() int { return int(s.queries.Load()) }
+
+// StartSilent listens and reads every question, and answers none of them - a
+// resolver that a network has blackholed rather than refused.
+func StartSilent() (*Server, error) {
+	s, err := Start(nil)
+	if err != nil {
+		return nil, err
+	}
+	s.silent = true
+	return s, nil
 }
 
 // Start listens on a loopback port and answers the given name → IPv4 pairs.
@@ -46,6 +63,10 @@ func (s *Server) serve() {
 		n, from, err := s.conn.ReadFrom(buf)
 		if err != nil {
 			return
+		}
+		s.queries.Add(1)
+		if s.silent {
+			continue
 		}
 		if reply, ok := s.answer(buf[:n]); ok {
 			_, _ = s.conn.WriteTo(reply, from)
