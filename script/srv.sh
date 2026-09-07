@@ -7,9 +7,14 @@ set -e
 PODMAN_ID=$(tr -dc 'a-z0-9' </dev/urandom | head -c 8)
 CONTAINER_NAME="olcrtc-server-$PODMAN_ID"
 IMAGE_NAME="docker.io/library/golang:1.26-alpine3.22"
-REPO_URL="https://github.com/openlibrecommunity/olcrtc.git"
+# The fork, not upstream. This script writes a server.yaml for the server the
+# fork builds; pointed at upstream it installed whatever upstream's master had
+# become that day - which by September had moved the name files out of the
+# repo root while this script still wrote `data: data`, and the container
+# restarted forever on "open data/names: no such file" (olcbox#14).
+REPO_URL="https://github.com/romanpodpriatov/olcrtc.git"
 WORK_DIR="/tmp/olcrtc-deploy-$PODMAN_ID"
-BRANCH="master"
+BRANCH="proofkit-udp-spike"
 NO_CACHE=0
 
 while [[ $# -gt 0 ]]; do
@@ -331,6 +336,15 @@ echo "[*] Using Go cache: $CACHE_DIR"
 echo "[*] Cloning repository..."
 git clone --depth 1 --recurse-submodules --branch "$BRANCH" "$REPO_URL" "$WORK_DIR"
 
+# The server resolves `data:` next to its own binary and refuses to start
+# without names to draw from. They live at the repo root here, but a checkout
+# that carries them only inside the package still gets a copy in the deploy
+# dir rather than a restart loop.
+if [ ! -f "$WORK_DIR/data/names" ] || [ ! -f "$WORK_DIR/data/surnames" ]; then
+    mkdir -p "$WORK_DIR/data"
+    cp "$WORK_DIR/internal/names/data/names" "$WORK_DIR/internal/names/data/surnames" "$WORK_DIR/data/"
+fi
+
 echo "[*] Pulling Go image..."
 podman pull "$IMAGE_NAME"
 
@@ -482,6 +496,19 @@ podman run -d \
     -w /app \
     "$IMAGE_NAME" \
     sh -c "$START_CMD"
+
+# `podman run -d` returning is not the server running: with --restart the
+# container can already be in a restart loop by the time the next line prints.
+# So the process is asked, not assumed - and a failure prints the reason
+# instead of "started successfully" over a crash.
+sleep 3
+running="$(podman inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || echo false)"
+restarts="$(podman inspect -f '{{.RestartCount}}' "$CONTAINER_NAME" 2>/dev/null || echo unknown)"
+if [ "$running" != "true" ] || [ "$restarts" != "0" ]; then
+    echo "[!] The server container is not staying up (running=$running, restarts=$restarts). Last log lines:" >&2
+    podman logs --tail 20 "$CONTAINER_NAME" >&2 || true
+    exit 1
+fi
 
 read -p "Enter a comment for the config (default: olc - t.me/openlibrecommunity): " sub_configname
 if [ -z "$sub_configname" ]; then
