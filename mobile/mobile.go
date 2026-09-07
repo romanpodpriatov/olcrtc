@@ -590,6 +590,7 @@ func startWithConfig(
 	// protected sockets keeps the lookup on the physical interface, where the
 	// dial that follows it goes anyway.
 	protect.SetDNSServers(cfg.dnsServer)
+	installDefaultTransport()
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	cancel = cancelFunc
@@ -718,6 +719,30 @@ func IsRunning() bool {
 
 func registerDefaults() {
 	registerSet.Do(session.RegisterDefaults)
+}
+
+// installDefaultTransport points http.DefaultTransport at the protected dialer.
+//
+// The Jitsi carrier's signalling goes through a library that dials with
+// http.DefaultClient and takes no dialer of its own, so on a phone those
+// sockets were neither protected nor resolved through the configured server:
+// an XMPP host the carrier's DNS would not name came back "no such host", and
+// on iOS a reconnect from inside the running tunnel - where only protected
+// sockets leave the device - had nowhere to go but the tunnel itself. Android
+// never showed it because bindProcessToNetwork covers every socket in the
+// process.
+//
+// A clone of whatever transport is there rather than a fresh one, so the TLS
+// and HTTP/2 behaviour the library was written against stays exactly as it
+// was; only the dial moves. Cloning an already-installed clone is harmless.
+func installDefaultTransport() {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return
+	}
+	transport := base.Clone()
+	transport.DialContext = protect.DialContext
+	http.DefaultTransport = transport
 }
 
 func waitForCheckDone(doneCh <-chan error) {
