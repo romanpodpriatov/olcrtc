@@ -191,20 +191,47 @@ func dialAddrs(ctx context.Context, port string, ips []net.IP) (net.Conn, error)
 	return nil, firstErr
 }
 
-// lookupFamilies resolves both address families concurrently and returns the
-// IPv6 addresses, the IPv4 addresses, and an error only when neither answered.
+// lookupFamilies resolves both address families and returns the IPv6
+// addresses, the IPv4 addresses, and an error only when nothing answered.
+//
+// The configured servers are asked first and on a budget; if they produce no
+// address at all the host's own resolver is asked. See [systemResolver] for
+// why that order and not the other.
 func lookupFamilies(ctx context.Context, host string) ([]net.IP, []net.IP, error) {
+	configured := activeResolver()
+	budget, cancel := context.WithTimeout(ctx, configuredLookupBudget)
+	v6, v4, err := lookupBoth(budget, configured, host)
+	cancel()
+	if len(v6) > 0 || len(v4) > 0 {
+		return v6, v4, nil
+	}
+
+	fallback := systemResolver
+	if fallback == nil || fallback == configured {
+		return nil, nil, err
+	}
+	v6, v4, fallbackErr := lookupBoth(ctx, fallback, host)
+	if len(v6) > 0 || len(v4) > 0 {
+		return v6, v4, nil
+	}
+	// The configured servers' failure is the one worth reporting: it names what
+	// this process chose to use, where the host's resolver is only the net.
+	return nil, nil, firstNonNil(err, fallbackErr)
+}
+
+// lookupBoth resolves both address families through one resolver, concurrently.
+func lookupBoth(ctx context.Context, r *net.Resolver, host string) ([]net.IP, []net.IP, error) {
 	type answer struct {
 		ips []net.IP
 		err error
 	}
 	ch6, ch4 := make(chan answer, 1), make(chan answer, 1)
 	go func() {
-		ips, lookupErr := lookupFamily(ctx, "ip6", host)
+		ips, lookupErr := lookupFamily(ctx, r, "ip6", host)
 		ch6 <- answer{ips: ips, err: lookupErr}
 	}()
 	go func() {
-		ips, lookupErr := lookupFamily(ctx, "ip4", host)
+		ips, lookupErr := lookupFamily(ctx, r, "ip4", host)
 		ch4 <- answer{ips: ips, err: lookupErr}
 	}()
 	got6, got4 := <-ch6, <-ch4
@@ -222,8 +249,8 @@ func lookupFamilies(ctx context.Context, host string) ([]net.IP, []net.IP, error
 // were the whole answer, so the caller cannot tell a host that has no AAAA from
 // one whose AAAA query failed, and either way is handed a list with nothing to
 // fall back to.
-func lookupFamily(ctx context.Context, network, host string) ([]net.IP, error) {
-	ips, err := activeResolver().LookupIP(ctx, network, host)
+func lookupFamily(ctx context.Context, r *net.Resolver, network, host string) ([]net.IP, error) {
+	ips, err := r.LookupIP(ctx, network, host)
 	if err != nil {
 		return nil, fmt.Errorf("lookup %s: %w", network, err)
 	}

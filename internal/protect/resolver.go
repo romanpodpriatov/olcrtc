@@ -17,6 +17,11 @@ var ErrDNSUnreachable = errors.New("no configured dns server could be reached")
 const (
 	defaultDNSPort    = "53"
 	defaultDNSTimeout = 3 * time.Second
+	// configuredLookupBudget bounds the whole attempt on the configured servers
+	// before the host's resolver is asked. Without it a network that blackholes
+	// every one of them costs the caller each server's silence in turn, and the
+	// tunnel start it belongs to gives up first.
+	configuredLookupBudget = 4 * time.Second
 	// dnsQueryTimeout bounds how long one query waits for one server. Go gives
 	// each exchange five seconds and then asks the same server again, so a
 	// resolver a network has blackholed used to consume the whole lookup
@@ -56,6 +61,16 @@ var publicOperators = [][2]string{ //nolint:gochecknoglobals // static lookup ta
 	{"8.8.8.8", "2001:4860:4860::8888"},
 	{"9.9.9.9", "2620:fe::fe"},
 }
+
+// systemResolver is the host's own resolver, kept as the last resort behind the
+// configured servers. A variable so a test can supply one.
+//
+// It is not a preference. Resolving names ourselves is what keeps a carrier
+// from answering for a host it would rather we did not reach - but a network
+// that blackholes every public operator leaves us with no answer at all, and
+// no answer is worse than the carrier's. So: ours first, the host's if ours
+// has nothing (olcbox#15).
+var systemResolver = net.DefaultResolver //nolint:gochecknoglobals // package-level, same shape as Protector
 
 // configured is the resolver protected dials look names up through.
 var configured struct { //nolint:gochecknoglobals // package-level state, same shape as Protector

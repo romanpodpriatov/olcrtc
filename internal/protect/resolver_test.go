@@ -214,3 +214,79 @@ func TestExpandDNSServersAppendsTheOtherPublicOperators(t *testing.T) {
 		}
 	}
 }
+
+// The host's own resolver is the last resort, and it has to be, because the
+// configured one is a public operator and some networks blackhole every public
+// operator there is. Answering nothing then is worse than asking the carrier:
+// before olcRTC resolved names itself the carrier's resolver was all there was,
+// and on the networks that permit it, it works (olcbox#15).
+func TestResolverFallsBackToTheSystemWhenNoConfiguredServerAnswers(t *testing.T) {
+	silent, err := fakedns.StartSilent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = silent.Close() }()
+	system, err := fakedns.Start(map[string]string{"carrier.test": "192.0.2.30"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = system.Close() }()
+
+	SetDNSServers(silent.Addr)
+	swapSystemResolver(t, NewResolver(system.Addr))
+	t.Cleanup(func() { SetDNSServers() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	started := time.Now()
+	v6, v4, err := lookupFamilies(ctx, "carrier.test")
+	if err != nil {
+		t.Fatalf("lookupFamilies() = %v after %v, want the system resolver's answer", err, time.Since(started))
+	}
+	if len(v4) != 1 || v4[0].String() != "192.0.2.30" {
+		t.Fatalf("lookupFamilies() v4 = %v (v6 %v), want [192.0.2.30]", v4, v6)
+	}
+	if silent.Queries() == 0 {
+		t.Fatal("the configured server was never asked; it must come first")
+	}
+}
+
+// And the configured server keeps its priority: while it answers, the host's
+// resolver is never consulted, because the whole point of resolving names
+// ourselves is not to ask a carrier that may lie about them.
+func TestConfiguredServerIsPreferredOverTheSystemResolver(t *testing.T) {
+	configured, err := fakedns.Start(map[string]string{"carrier.test": "192.0.2.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = configured.Close() }()
+	system, err := fakedns.Start(map[string]string{"carrier.test": "192.0.2.30"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = system.Close() }()
+
+	SetDNSServers(configured.Addr)
+	swapSystemResolver(t, NewResolver(system.Addr))
+	t.Cleanup(func() { SetDNSServers() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, v4, err := lookupFamilies(ctx, "carrier.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v4) != 1 || v4[0].String() != "192.0.2.10" {
+		t.Fatalf("lookupFamilies() v4 = %v, want the configured server's [192.0.2.10]", v4)
+	}
+	if n := system.Queries(); n != 0 {
+		t.Fatalf("the host's resolver was asked %d times while the configured one answered", n)
+	}
+}
+
+func swapSystemResolver(t *testing.T, r *net.Resolver) {
+	t.Helper()
+	previous := systemResolver
+	systemResolver = r
+	t.Cleanup(func() { systemResolver = previous })
+}
