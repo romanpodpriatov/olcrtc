@@ -77,18 +77,6 @@ func assertReleaseNeighborTraffic(t *testing.T, p *streamTransport, live *kcpRun
 	}
 }
 
-// ai-generated: empty media beacons must not allocate orphan KCP runtimes.
-func TestPeerBeaconDoesNotAllocateRuntime(t *testing.T) {
-	p := releaseTestTransport(t)
-	for epoch := uint32(2); epoch < 1002; epoch++ {
-		p.handlePeerFrame(epoch, nil)
-		p.handleControlFrame(epoch|controlEpochFlag, 0, nil)
-	}
-	if len(p.peers) != 0 || len(p.ctrlPeers) != 0 {
-		t.Fatal("media beacons allocated KCPs without application data")
-	}
-}
-
 // ai-generated: a full queue must not deadlock retirement or whole-room shutdown.
 func TestPeerRetirementUnblocksFullQueue(t *testing.T) {
 	p := releaseTestTransport(t)

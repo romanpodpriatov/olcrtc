@@ -1327,7 +1327,8 @@ func (p *streamTransport) handleControlFrame(src, dst uint32, kcpPayload []byte)
 // session so multiple clients can coexist in the same room.
 func (p *streamTransport) handlePeerFrame(peerEpoch uint32, kcpPayload []byte) {
 	if len(kcpPayload) == 0 {
-		// ai-generated: empty carrier beacons do not own a server session or KCP.
+		// Keepalive - ensure peer is registered but nothing to deliver.
+		p.getOrCreatePeerKCP(peerEpoch)
 		return
 	}
 
