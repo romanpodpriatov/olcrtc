@@ -19,20 +19,7 @@ import (
 // tunnel's own, unserved until the cores are up - so a name not already in the
 // phone's DNS cache could not be resolved at all (olcbox#13).
 func TestStartInstallsTheConfiguredResolverForProtectedDials(t *testing.T) {
-	carrier, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = carrier.Close() }()
-	go func() {
-		for {
-			c, acceptErr := carrier.Accept()
-			if acceptErr != nil {
-				return
-			}
-			_ = c.Close()
-		}
-	}()
+	port := listenCarrier(t)
 	dns, err := fakedns.Start(map[string]string{"carrier.test": "127.0.0.1"})
 	if err != nil {
 		t.Fatal(err)
@@ -47,7 +34,6 @@ func TestStartInstallsTheConfiguredResolverForProtectedDials(t *testing.T) {
 		protect.SetDNSServers()
 	})
 
-	_, port, _ := net.SplitHostPort(carrier.Addr().String())
 	dialed := make(chan error, 1)
 	runClientWithReady = func(ctx context.Context, _ client.Config, _ func()) error {
 		// What the client does first: dial the carrier by name.
@@ -126,4 +112,83 @@ func TestStartRoutesTheDefaultHTTPTransportThroughTheProtectedDialer(t *testing.
 	case <-time.After(10 * time.Second):
 		t.Fatal("the client never made its request")
 	}
+}
+
+// The platform knows the resolvers of the network it stands on - Android from
+// the upstream network's link properties, iOS from the resolver state read
+// before the tunnel's own settings replace it - and hands them over as one
+// string with several servers in it. Those are asked first, in order; the
+// public operator the app appends stays behind them, for the networks where
+// the carrier's own servers stop answering (olcbox#16).
+func TestSetDNSTakesAListAndAsksItInOrder(t *testing.T) {
+	port := listenCarrier(t)
+	silent, err := fakedns.StartSilent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = silent.Close() }()
+	answering, err := fakedns.Start(map[string]string{"carrier.test": "127.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = answering.Close() }()
+
+	original := runClientWithReady
+	t.Cleanup(func() {
+		Stop()
+		runClientWithReady = original
+		SetDNS(defaultDNSServer)
+		protect.SetDNSServers()
+	})
+
+	dialed := make(chan error, 1)
+	runClientWithReady = func(ctx context.Context, _ client.Config, _ func()) error {
+		conn, dialErr := protect.DialContext(ctx, "tcp", net.JoinHostPort("carrier.test", port))
+		if dialErr == nil {
+			_ = conn.Close()
+		}
+		dialed <- dialErr
+		return nil
+	}
+
+	SetDNS(silent.Addr + ", " + answering.Addr)
+	if err := Start("telemost", "https://telemost.example/j/1", "device", "00", 10808, "", ""); err != nil {
+		t.Fatalf("Start() = %v", err)
+	}
+	select {
+	case dialErr := <-dialed:
+		if dialErr != nil {
+			t.Fatalf("carrier dial after Start = %v, want it resolved through the second server of the list", dialErr)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the client never dialed")
+	}
+	if silent.Queries() == 0 {
+		t.Fatal("the first server of the list was never asked; the list is an order")
+	}
+	if answering.Queries() == 0 {
+		t.Fatal("the second server of the list was never asked")
+	}
+}
+
+// listenCarrier stands in for a carrier's host: a TCP listener that accepts
+// and hangs up. It returns the port to dial by name.
+func listenCarrier(t *testing.T) string {
+	t.Helper()
+	carrier, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = carrier.Close() })
+	go func() {
+		for {
+			c, acceptErr := carrier.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	_, port, _ := net.SplitHostPort(carrier.Addr().String())
+	return port
 }

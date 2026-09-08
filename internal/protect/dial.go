@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -191,32 +192,91 @@ func dialAddrs(ctx context.Context, port string, ips []net.IP) (net.Conn, error)
 	return nil, firstErr
 }
 
+// lookupError is what a lookup nobody answered says: which resolver was asked
+// and what each one said. "8.8.8.8 timed out" and "the carrier's resolver knows
+// no such host" look the same in a log and mean different things (olcbox#16).
+type lookupError struct {
+	host       string
+	configured error
+	system     error
+}
+
+func (e *lookupError) Error() string {
+	parts := make([]string, 0, 2)
+	if e.configured != nil {
+		parts = append(parts, "configured servers: "+e.configured.Error())
+	}
+	if e.system != nil {
+		parts = append(parts, "host resolver: "+e.system.Error())
+	}
+	return "lookup " + e.host + ": " + strings.Join(parts, "; ")
+}
+
+func (e *lookupError) Unwrap() []error {
+	errs := make([]error, 0, 2)
+	if e.configured != nil {
+		errs = append(errs, e.configured)
+	}
+	if e.system != nil {
+		errs = append(errs, e.system)
+	}
+	return errs
+}
+
 // lookupFamilies resolves both address families and returns the IPv6
 // addresses, the IPv4 addresses, and an error only when nothing answered.
 //
 // The configured servers are asked first and on a budget; if they produce no
-// address at all the host's own resolver is asked. See [systemResolver] for
-// why that order and not the other.
+// address at all the host's own resolver is asked, on a budget of its own. See
+// [systemResolver] for why that order and not the other - and [serverRing] for
+// the exception: servers that have just proven dark are asked last, since
+// paying their silence again on every lookup buys nothing.
 func lookupFamilies(ctx context.Context, host string) ([]net.IP, []net.IP, error) {
 	configured := activeResolver()
-	budget, cancel := context.WithTimeout(ctx, configuredLookupBudget)
-	v6, v4, err := lookupBoth(budget, configured, host)
-	cancel()
-	if len(v6) > 0 || len(v4) > 0 {
-		return v6, v4, nil
+	fallback := systemResolver
+	if fallback == configured {
+		fallback = nil
+	}
+	dark := false
+	if ring := configuredRing(); ring != nil && fallback != nil {
+		dark = ring.dark(ringNow())
 	}
 
-	fallback := systemResolver
-	if fallback == nil || fallback == configured {
-		return nil, nil, err
+	var configuredErr, systemErr error
+	if !dark {
+		v6, v4, err := lookupBounded(ctx, configured, host, configuredLookupBudget)
+		if len(v6) > 0 || len(v4) > 0 {
+			return v6, v4, nil
+		}
+		if fallback == nil {
+			return nil, nil, err
+		}
+		configuredErr = err
 	}
-	v6, v4, fallbackErr := lookupBoth(ctx, fallback, host)
+	v6, v4, err := lookupBounded(ctx, fallback, host, systemLookupBudget)
 	if len(v6) > 0 || len(v4) > 0 {
 		return v6, v4, nil
 	}
-	// The configured servers' failure is the one worth reporting: it names what
-	// this process chose to use, where the host's resolver is only the net.
-	return nil, nil, firstNonNil(err, fallbackErr)
+	systemErr = err
+	if dark {
+		// The host's resolver had nothing either, so the configured servers
+		// get their turn after all, on the usual budget.
+		v6, v4, err = lookupBounded(ctx, configured, host, configuredLookupBudget)
+		if len(v6) > 0 || len(v4) > 0 {
+			return v6, v4, nil
+		}
+		configuredErr = err
+	}
+	return nil, nil, &lookupError{host: host, configured: configuredErr, system: systemErr}
+}
+
+// lookupBounded is lookupBoth on a budget of its own within ctx.
+func lookupBounded(
+	ctx context.Context, r *net.Resolver, host string, budget time.Duration,
+) ([]net.IP, []net.IP, error) {
+	bounded, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	return lookupBoth(bounded, r, host)
 }
 
 // lookupBoth resolves both address families through one resolver, concurrently.
@@ -264,4 +324,82 @@ func firstNonNil(errs ...error) error {
 		}
 	}
 	return ErrNoAddresses
+}
+
+// resolveAddress resolves "host:port" to "ip:port" for one dial, through the
+// configured servers and the host's resolver like every other name here.
+func resolveAddress(ctx context.Context, network, address string) (string, error) {
+	ip, port, zone, err := resolveHostPort(ctx, network, address)
+	if err != nil {
+		return "", err
+	}
+	host := ip.String()
+	if zone != "" {
+		host += "%" + zone
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
+}
+
+// resolveHostPort resolves "host:port" to the one address the network wants:
+// the family a "udp4" or "tcp6" names, else the family with a route out. A
+// literal is returned as it is, zone included.
+func resolveHostPort(ctx context.Context, network, address string) (net.IP, int, string, error) {
+	host, portName, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("split address: %w", err)
+	}
+	port, err := net.DefaultResolver.LookupPort(ctx, network, portName)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("port %q: %w", portName, err)
+	}
+	ip, zone, err := resolveHost(ctx, network, host)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	return ip, port, zone, nil
+}
+
+// resolveHost resolves a bare host the same way, for the pion lookups that
+// carry no port.
+func resolveHost(ctx context.Context, network, host string) (net.IP, string, error) {
+	zone := ""
+	if i := strings.IndexByte(host, '%'); i >= 0 {
+		host, zone = host[:i], host[i+1:]
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip, zone, nil
+	}
+	v6, v4, err := lookupFamilies(ctx, host)
+	if err != nil {
+		return nil, "", err
+	}
+	ip, err := pickAddress(network, v6, v4)
+	if err != nil {
+		return nil, "", fmt.Errorf("resolve %s: %w", host, err)
+	}
+	return ip, "", nil
+}
+
+// pickAddress chooses one address for a network that takes one: the family the
+// network names, else the family that has a route out, as the dialers order
+// them.
+func pickAddress(network string, v6, v4 []net.IP) (net.IP, error) {
+	switch {
+	case strings.HasSuffix(network, "4"):
+		if len(v4) == 0 {
+			return nil, fmt.Errorf("%w: no IPv4 address for %s", ErrNoAddresses, network)
+		}
+		return v4[0], nil
+	case strings.HasSuffix(network, "6"):
+		if len(v6) == 0 {
+			return nil, fmt.Errorf("%w: no IPv6 address for %s", ErrNoAddresses, network)
+		}
+		return v6[0], nil
+	case len(v6) == 0:
+		return v4[0], nil
+	case len(v4) == 0:
+		return v6[0], nil
+	}
+	first, _, _ := orderFamilies(v6, v4)
+	return first[0], nil
 }

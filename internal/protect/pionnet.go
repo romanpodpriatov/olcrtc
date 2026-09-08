@@ -108,23 +108,53 @@ func (n *ProtectedNet) ListenUDP(network string, locAddr *net.UDPAddr) (transpor
 
 // Dial connects to the address on a protected socket.
 //
-// The name in it is resolved through the configured resolver, over protected
-// sockets, rather than the system one. These dialers used to carry only the
-// Control hook, so a TURN or signalling host went to the system resolver -
-// inside an iOS packet tunnel the tunnel's own, unserved until the cores are
-// up - and a host not already in the phone's cache came back "no such host".
+// The name in it goes the way of every other name here: the configured
+// servers over protected sockets, then the host's resolver. These dialers used
+// to carry only the Control hook, so a TURN or signalling host went to the
+// system resolver - inside an iOS packet tunnel the tunnel's own, unserved
+// until the cores are up - and a host not already in the phone's cache came
+// back "no such host".
 func (n *ProtectedNet) Dial(network, address string) (net.Conn, error) {
-	d := net.Dialer{Control: controlFunc, Resolver: activeResolver()}
-	conn, err := d.Dial(network, address)
+	conn, err := DialContext(context.Background(), network, address)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s %q: %w", network, address, err)
 	}
 	return conn, nil
 }
 
+// ResolveUDPAddr resolves the address through the configured servers and the
+// host's resolver, in that order. Pion resolves its STUN and TURN servers
+// through this, and the standard net underneath would have asked the system
+// resolver - inside an iOS packet tunnel, the tunnel's own (olcbox#16).
+func (n *ProtectedNet) ResolveUDPAddr(network, address string) (*net.UDPAddr, error) {
+	ip, port, zone, err := resolveHostPort(context.Background(), network, address)
+	if err != nil {
+		return nil, fmt.Errorf("resolve udp %q: %w", address, err)
+	}
+	return &net.UDPAddr{IP: ip, Port: port, Zone: zone}, nil
+}
+
+// ResolveTCPAddr resolves the address like ResolveUDPAddr.
+func (n *ProtectedNet) ResolveTCPAddr(network, address string) (*net.TCPAddr, error) {
+	ip, port, zone, err := resolveHostPort(context.Background(), network, address)
+	if err != nil {
+		return nil, fmt.Errorf("resolve tcp %q: %w", address, err)
+	}
+	return &net.TCPAddr{IP: ip, Port: port, Zone: zone}, nil
+}
+
+// ResolveIPAddr resolves the host like ResolveUDPAddr.
+func (n *ProtectedNet) ResolveIPAddr(network, address string) (*net.IPAddr, error) {
+	ip, zone, err := resolveHost(context.Background(), network, address)
+	if err != nil {
+		return nil, fmt.Errorf("resolve ip %q: %w", address, err)
+	}
+	return &net.IPAddr{IP: ip, Zone: zone}, nil
+}
+
 // DialUDP connects to a UDP address on a protected socket.
 func (n *ProtectedNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transport.UDPConn, error) {
-	d := net.Dialer{Control: controlFunc, Resolver: activeResolver()}
+	d := net.Dialer{Control: controlFunc}
 	if laddr != nil {
 		d.LocalAddr = laddr
 	}
@@ -143,7 +173,7 @@ func (n *ProtectedNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (trans
 
 // DialTCP connects to a TCP address on a protected socket.
 func (n *ProtectedNet) DialTCP(network string, laddr, raddr *net.TCPAddr) (transport.TCPConn, error) {
-	d := net.Dialer{Control: controlFunc, Resolver: activeResolver()}
+	d := net.Dialer{Control: controlFunc}
 	if laddr != nil {
 		d.LocalAddr = laddr
 	}
@@ -191,9 +221,31 @@ func (n *ProtectedNet) CreateDialer(d *net.Dialer) transport.Dialer {
 	// Names resolve where the sockets are protected, not through the system
 	// resolver - see Dial. A resolver the caller chose is left alone.
 	if dialer.Resolver == nil {
-		dialer.Resolver = activeResolver()
+		return resolvingDialer{Dialer: n.Net.CreateDialer(&dialer)}
 	}
 	return n.Net.CreateDialer(&dialer)
+}
+
+// resolvingDialer resolves a name before the dialer underneath sees it, so the
+// lookup goes through the configured servers and the host's resolver rather
+// than whatever net.Dialer would ask.
+type resolvingDialer struct {
+	transport.Dialer
+}
+
+func (d resolvingDialer) Dial(network, address string) (net.Conn, error) {
+	if !isIPLiteral(address) {
+		literal, err := resolveAddress(context.Background(), network, address)
+		if err != nil {
+			return nil, fmt.Errorf("dial %s %q: %w", network, address, err)
+		}
+		address = literal
+	}
+	conn, err := d.Dialer.Dial(network, address)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s %q: %w", network, address, err)
+	}
+	return conn, nil
 }
 
 // CreateListenConfig returns a listen config that protects each fd. It copies

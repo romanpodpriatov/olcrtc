@@ -206,6 +206,15 @@ func TestExpandDNSServersAppendsTheOtherPublicOperators(t *testing.T) {
 			in:   []string{"10.0.0.1:53"},
 			want: []string{"10.0.0.1:53"},
 		},
+		"the platform's list stays ahead of the operators": {
+			in: []string{"10.0.0.1:53, fe80::1%pdp_ip0 1.1.1.1:53"},
+			want: []string{
+				"10.0.0.1:53", "[fe80::1%pdp_ip0]:53",
+				"1.1.1.1:53", "[2606:4700:4700::1111]:53",
+				"8.8.8.8:53", "[2001:4860:4860::8888]:53",
+				"9.9.9.9:53", "[2620:fe::fe]:53",
+			},
+		},
 	}
 	for name, tc := range cases {
 		got := expandDNSServers(tc.in)
@@ -289,4 +298,148 @@ func swapSystemResolver(t *testing.T, r *net.Resolver) {
 	previous := systemResolver
 	systemResolver = r
 	t.Cleanup(func() { systemResolver = previous })
+}
+
+// A carrier that blackholes every public operator does not change its mind
+// between one lookup and the next, so paying the configured servers' silence
+// on every lookup is paying for what is already known - and a tunnel start
+// makes several lookups in a row, each of which used to cost the whole
+// budget. The first lookup learns it; the ones that follow go to the host's
+// resolver at once (olcbox#16).
+func TestLookupSkipsTheConfiguredServersWhileTheyAllStaySilent(t *testing.T) {
+	silent, err := fakedns.StartSilent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = silent.Close() }()
+	system, err := fakedns.Start(map[string]string{"carrier.test": "192.0.2.30"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = system.Close() }()
+
+	SetDNSServers(silent.Addr)
+	swapSystemResolver(t, NewResolver(system.Addr))
+	t.Cleanup(func() { SetDNSServers() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, _, err := lookupFamilies(ctx, "carrier.test"); err != nil {
+		t.Fatalf("first lookupFamilies() = %v, want the host's answer", err)
+	}
+	asked := silent.Queries()
+	if asked == 0 {
+		t.Fatal("the configured server was never asked on the first lookup; it must come first")
+	}
+
+	started := time.Now()
+	_, v4, err := lookupFamilies(ctx, "carrier.test")
+	if err != nil {
+		t.Fatalf("second lookupFamilies() = %v, want the host's answer", err)
+	}
+	if len(v4) != 1 || v4[0].String() != "192.0.2.30" {
+		t.Fatalf("second lookupFamilies() v4 = %v, want [192.0.2.30]", v4)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("second lookup took %v; the configured servers' silence was already known", elapsed)
+	}
+	if n := silent.Queries(); n != asked {
+		t.Fatalf("the silent server was asked %d more times on the second lookup", n-asked)
+	}
+}
+
+// When the host's resolver fails as well, the error used to name only the
+// configured servers' timeout, so a log read as "8.8.8.8 is blocked" when the
+// carrier's own resolver had refused the name too - the two look the same and
+// mean different things. Both halves are named.
+func TestLookupErrorNamesBothResolvers(t *testing.T) {
+	silent, err := fakedns.StartSilent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = silent.Close() }()
+	// Answers, but knows no names: the "no such host" a filtering resolver gives.
+	system, err := fakedns.Start(map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = system.Close() }()
+
+	SetDNSServers(silent.Addr)
+	swapSystemResolver(t, NewResolver(system.Addr))
+	t.Cleanup(func() { SetDNSServers() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, _, err = lookupFamilies(ctx, "carrier.test")
+	if err == nil {
+		t.Fatal("lookupFamilies() succeeded with nobody knowing the name")
+	}
+	msg := err.Error()
+	for _, want := range []string{"configured", "i/o timeout", "host", "no such host"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q does not mention %q", msg, want)
+		}
+	}
+}
+
+func TestSplitDNSServersAcceptsWhatPlatformsHandOver(t *testing.T) {
+	got := SplitDNSServers(" 10.0.0.1:53, fe80::1%pdp_ip0 ;1.1.1.1 ")
+	want := []string{"10.0.0.1:53", "fe80::1%pdp_ip0", "1.1.1.1"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("SplitDNSServers() = %q, want %q", got, want)
+	}
+	if got := SplitDNSServers(" , ; "); len(got) != 0 {
+		t.Fatalf("SplitDNSServers() of separators alone = %q, want nothing", got)
+	}
+}
+
+// Dark is not forever: a network that blocked every public operator may stop,
+// and a phone moves between networks under a running tunnel. Once the window
+// has passed the configured servers are asked first again.
+func TestLookupAsksTheConfiguredServersAgainAfterTheDarkWindow(t *testing.T) {
+	silent, err := fakedns.StartSilent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = silent.Close() }()
+	system, err := fakedns.Start(map[string]string{"carrier.test": "192.0.2.30"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = system.Close() }()
+
+	SetDNSServers(silent.Addr)
+	swapSystemResolver(t, NewResolver(system.Addr))
+	t.Cleanup(func() { SetDNSServers() })
+	// The ring's clock, held still: the window is measured on it, not on
+	// how long the machine took to run the lookups.
+	now := time.Now()
+	ringNow = func() time.Time { return now }
+	t.Cleanup(func() { ringNow = time.Now })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, _, err := lookupFamilies(ctx, "carrier.test"); err != nil {
+		t.Fatalf("first lookupFamilies() = %v", err)
+	}
+	asked := silent.Queries()
+	if _, _, err := lookupFamilies(ctx, "carrier.test"); err != nil {
+		t.Fatalf("second lookupFamilies() = %v", err)
+	}
+	if n := silent.Queries(); n != asked {
+		t.Fatalf("the dark servers were asked %d times within the window", n-asked)
+	}
+
+	now = now.Add(ringDarkWindow + time.Second)
+	_, v4, err := lookupFamilies(ctx, "carrier.test")
+	if err != nil {
+		t.Fatalf("lookupFamilies() after the window = %v", err)
+	}
+	if len(v4) != 1 || v4[0].String() != "192.0.2.30" {
+		t.Fatalf("lookupFamilies() after the window v4 = %v, want the host's [192.0.2.30]", v4)
+	}
+	if n := silent.Queries(); n == asked {
+		t.Fatal("the configured servers were not asked again after the window")
+	}
 }

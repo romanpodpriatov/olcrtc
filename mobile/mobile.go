@@ -125,12 +125,23 @@ func SetTransport(transport string) {
 	defaults.transport = normalizeTransport(transport)
 }
 
-// SetDNS selects the DNS server used by the tunnel.
+// SetDNS selects the DNS servers the tunnel resolves names through: one
+// "host:port", or several separated by commas, semicolons or spaces, asked in
+// that order. The platform passes the resolvers of the network it stands on
+// first and a public operator behind them; the engine adds that operator's
+// IPv6 address and the other public operators after it (olcbox#16).
+//
+// A running engine takes the change at once - the platform calls this when
+// the network under the tunnel changes, and the next lookup should ask that
+// network's resolvers rather than the previous one's.
 func SetDNS(dnsServer string) {
 	mu.Lock()
 	defer mu.Unlock()
 	ensureDefaultConfigLocked()
 	defaults.dnsServer = dnsServer
+	if cancel != nil {
+		protect.SetDNSServers(dnsServer)
+	}
 }
 
 // SetWBToken sets the pre-issued wbstream account token (auth.token).

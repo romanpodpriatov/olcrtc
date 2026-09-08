@@ -191,12 +191,24 @@ func RedactSensitive(text string) string {
 // single dropped AAAA is enough for them not to - which on a link with no IPv4
 // leaves an immediate ENETUNREACH as the only outcome (#1).
 func DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	if network == "tcp" && !isIPLiteral(address) {
-		conn, err := dialDualStack(ctx, address)
-		if err != nil {
-			return nil, fmt.Errorf("dial failed: %w", err)
+	if !isIPLiteral(address) {
+		switch network {
+		case "tcp":
+			conn, err := dialDualStack(ctx, address)
+			if err != nil {
+				return nil, fmt.Errorf("dial failed: %w", err)
+			}
+			return conn, nil
+		case "tcp4", "tcp6", "udp", "udp4", "udp6":
+			// One family named, or a datagram socket that cannot race two:
+			// the name still goes through the same resolvers as every other,
+			// and the dial gets the one address the network can use.
+			literal, err := resolveAddress(ctx, network, address)
+			if err != nil {
+				return nil, fmt.Errorf("dial failed: %w", err)
+			}
+			address = literal
 		}
-		return conn, nil
 	}
 	conn, err := NewDialer().DialContext(ctx, network, address)
 	if err != nil {
