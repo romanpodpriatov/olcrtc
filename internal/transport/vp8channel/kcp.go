@@ -162,7 +162,8 @@ func (r *kcpRuntime) send(msg []byte) error {
 
 func (r *kcpRuntime) close() {
 	r.closeOnce.Do(func() {
-		_ = r.sess.Close()
+		// ai-generated: unblock a full outbound queue before KCP flushes on Close.
 		_ = r.conn.Close()
+		_ = r.sess.Close()
 	})
 }
