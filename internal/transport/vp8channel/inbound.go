@@ -110,10 +110,12 @@ func (p *streamTransport) maybePeerRestart(src uint32) {
 // creating one on demand. Each peer epoch gets its own independent KCP
 // session so multiple clients can coexist in the same room.
 func (p *streamTransport) handlePeerFrame(peerEpoch uint32, kcpPayload []byte) {
-	// Registering the peer even for an empty keepalive is what refreshes its
-	// idle timer, so a quiet-but-live client is not swept away.
+	if len(kcpPayload) == 0 {
+		// ai-generated: empty carrier beacons do not own a server session or KCP.
+		return
+	}
 	sess := p.peerSessionFor(peerEpoch)
-	if sess == nil || len(kcpPayload) == 0 {
+	if sess == nil {
 		return
 	}
 

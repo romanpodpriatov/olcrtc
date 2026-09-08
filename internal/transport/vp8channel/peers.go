@@ -82,9 +82,9 @@ func (s *peerSession) close() {
 		s.control = nil
 		s.controlMu.Unlock()
 
-		s.data.close()
+		s.data.abortPeer()
 		if control != nil {
-			control.close()
+			control.abortPeer()
 		}
 
 		close(s.done)
@@ -114,6 +114,11 @@ type peerTable struct {
 	// KCP state machines, which reassemble garbage that fails AEAD
 	// authentication one layer up in muxconn - see olcrtc#142.
 	createMu sync.Mutex
+
+	// ai-generated: bounded retired-epoch fence, guarded by mu.
+	retiredPeers map[uint32]struct{}
+	retiredOrder []uint32
+	retiredNext  int
 }
 
 // get returns the session for epoch, refreshing its idle timer.
@@ -143,6 +148,11 @@ func (t *peerTable) add(sess *peerSession) bool {
 	defer t.mu.Unlock()
 
 	if t.closed {
+		return false
+	}
+
+	// ai-generated: retirement may have won while the session was being built.
+	if _, retired := t.retiredPeers[sess.epoch]; retired {
 		return false
 	}
 
@@ -254,6 +264,10 @@ func parsePeerID(peerID string) (uint32, error) {
 // instead of racing to install two independent KCP runtimes for it. See
 // olcrtc#142.
 func (p *streamTransport) peerSessionFor(epoch uint32) *peerSession {
+	// ai-generated: retired epochs cannot recreate transport resources.
+	if p.peers.retired(epoch) || p.closed.Load() {
+		return nil
+	}
 	if sess := p.peers.get(epoch); sess != nil {
 		return sess
 	}

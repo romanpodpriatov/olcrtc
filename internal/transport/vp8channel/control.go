@@ -14,7 +14,17 @@ func (p *streamTransport) ControlSend(data []byte) error {
 // ControlSendTo sends data on the per-peer control KCP for peerID.
 // Implements transport.PeerControlPlane.
 func (p *streamTransport) ControlSendTo(peerID string, data []byte) error {
-	return p.sendToPeer(peerID, data, p.peerControlFor)
+	return p.sendToPeer(peerID, data, p.peerControlForSend)
+}
+
+// ai-generated: permit the existing control KCP to send the final CLOSE.
+func (p *streamTransport) peerControlForSend(epoch uint32) *kcpRuntime {
+	if sess := p.peers.get(epoch); sess != nil {
+		if control := sess.controlRuntime(); control != nil {
+			return control
+		}
+	}
+	return p.peerControlFor(epoch)
 }
 
 // SetControlOnData implements transport.ControlPlane.

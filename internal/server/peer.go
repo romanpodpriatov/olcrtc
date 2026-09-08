@@ -195,6 +195,11 @@ func (s *Server) getOrCreatePeerControlSession(peerID string) *peerSession {
 		return nil
 	}
 	s.sessMu.Lock()
+	// ai-generated: drop callbacks queued before transport retirement.
+	if s.peerRetired(peerID) {
+		s.sessMu.Unlock()
+		return nil
+	}
 	peer := s.peerSessions[peerID]
 	if peer != nil {
 		if conn, _ := peer.controlPlane(); conn != nil {
@@ -309,7 +314,11 @@ func (s *Server) goTracked(fn func()) {
 func (s *Server) onPeerData(peerID string, data []byte) {
 	peer := s.getPeerSession(peerID)
 	if peer == nil {
-		s.onData(data)
+		// Not in peer-routing mode: fall back to the single data conn.
+		// ai-generated: retired peer callbacks must not enter the singleton path.
+		if s.peerLn == nil {
+			s.onData(data)
+		}
 		return
 	}
 	tunnelcore.PushData(peer.dataConn(), data)
@@ -320,6 +329,11 @@ func (s *Server) getPeerSession(peerID string) *peerSession {
 		return nil
 	}
 	s.sessMu.Lock()
+	// ai-generated: drop callbacks queued before transport retirement.
+	if s.peerRetired(peerID) {
+		s.sessMu.Unlock()
+		return nil
+	}
 	peer := s.peerSessions[peerID]
 	if peer != nil && peer.dataConn() != nil {
 		s.sessMu.Unlock()
@@ -503,19 +517,21 @@ func (s *Server) waitPeerHandshake(peer *peerSession) bool {
 	}
 }
 
+// ai-generated: only the owning session may retire an epoch and release its KCPs.
 func (s *Server) removePeer(peer *peerSession, reason string) {
 	if peer == nil {
 		return
 	}
 	s.sessMu.Lock()
-	current := s.peerSessions[peer.peerID] == peer
-	if current {
-		delete(s.peerSessions, peer.peerID)
+	if s.peerSessions[peer.peerID] != peer {
+		s.sessMu.Unlock()
+		return
 	}
+	cleanup := s.retirePeer(peer.peerID)
+	delete(s.peerSessions, peer.peerID)
 	s.sessMu.Unlock()
-	if current {
-		s.closePeerSession(peer, reason)
-	}
+	defer cleanup()
+	s.closePeerSession(peer, reason)
 }
 
 func (s *Server) closePeerSession(peer *peerSession, reason string) {
