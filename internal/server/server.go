@@ -441,6 +441,11 @@ func (s *Server) onPeerControlData(peerID string, data []byte) {
 // getPeerSession when the first data frame arrives.
 func (s *Server) getOrCreatePeerControlSession(peerID string) *peerSession {
 	s.sessMu.Lock()
+	// ai-generated: drop callbacks queued before transport retirement.
+	if s.peerRetired(peerID) {
+		s.sessMu.Unlock()
+		return nil
+	}
 	ps := s.peerSessions[peerID]
 	if ps != nil {
 		s.sessMu.Unlock()
@@ -637,6 +642,11 @@ func (s *Server) closeSession() {
 	control := s.controlStrm
 	controlStop := s.controlStop
 	peers := s.peerSessions
+	// ai-generated: fence every old epoch before publishing an empty session map.
+	cleanups := make([]func(), 0, len(peers))
+	for peerID := range peers {
+		cleanups = append(cleanups, s.retirePeer(peerID))
+	}
 	s.peerSessions = make(map[string]*peerSession)
 	s.session = nil
 	s.conn = nil
@@ -669,16 +679,24 @@ func (s *Server) closeSession() {
 	for _, ps := range peers {
 		s.closePeerSession(ps, "closed")
 	}
+	// ai-generated: release KCP resources after best-effort CLOSE notifications.
+	for _, cleanup := range cleanups {
+		cleanup()
+	}
 }
 
-func (s *Server) removePeerSession(peerID, reason string) {
+// ai-generated: only the owning session may retire an epoch and release its KCPs.
+func (s *Server) removePeerSession(ps *peerSession, reason string) {
 	s.sessMu.Lock()
-	ps := s.peerSessions[peerID]
-	delete(s.peerSessions, peerID)
-	s.sessMu.Unlock()
-	if ps != nil {
-		s.closePeerSession(ps, reason)
+	if s.peerSessions[ps.peerID] != ps {
+		s.sessMu.Unlock()
+		return
 	}
+	cleanup := s.retirePeer(ps.peerID)
+	delete(s.peerSessions, ps.peerID)
+	s.sessMu.Unlock()
+	defer cleanup()
+	s.closePeerSession(ps, reason)
 }
 
 func (s *Server) closePeerSession(ps *peerSession, reason string) {
@@ -778,7 +796,10 @@ func (s *Server) onPeerData(peerID string, data []byte) {
 	ps := s.getPeerSession(peerID)
 	if ps == nil {
 		// Not in peer-routing mode: fall back to the single data conn.
-		s.onData(data)
+		// ai-generated: retired peer callbacks must not enter the singleton path.
+		if s.peerLn == nil {
+			s.onData(data)
+		}
 		return
 	}
 	ps.conn.Push(data)
@@ -792,6 +813,11 @@ func (s *Server) getPeerSession(peerID string) *peerSession {
 	// exist (created by getOrCreatePeerControlSession when the first control
 	// frame arrived). If so, just attach the data conn to it.
 	s.sessMu.Lock()
+	// ai-generated: drop callbacks queued before transport retirement.
+	if s.peerRetired(peerID) {
+		s.sessMu.Unlock()
+		return nil
+	}
 	ps := s.peerSessions[peerID]
 	if ps != nil && ps.conn != nil {
 		// Data conn already wired; nothing to do.
@@ -1025,7 +1051,7 @@ func (s *Server) acceptPeerHandshake(ctx context.Context, ps *peerSession) {
 			default:
 			}
 			logger.Infof("server: AcceptStream(peer control=%s) error: %v", ps.peerID, err)
-			s.removePeerSession(ps.peerID, "handshake failed")
+			s.removePeerSession(ps, "handshake failed")
 			return
 		}
 		_ = stream.SetDeadline(time.Now().Add(handshake.DefaultTimeout))
@@ -1038,7 +1064,7 @@ func (s *Server) acceptPeerHandshake(ctx context.Context, ps *peerSession) {
 				continue
 			}
 			logger.Warnf("handshake peer=%s failed: %v", ps.peerID, err)
-			s.removePeerSession(ps.peerID, "handshake failed")
+			s.removePeerSession(ps, "handshake failed")
 			return
 		}
 		// Populate the peerSession and signal readiness so waitPeerHandshake unblocks.
@@ -1107,7 +1133,7 @@ func (s *Server) startPeerControlLoop(ctx context.Context, ps *peerSession, stre
 		if err != nil {
 			logger.Warnf("peer control stream ended peer=%s: %v", ps.peerID, err)
 		}
-		s.removePeerSession(ps.peerID, "liveness")
+		s.removePeerSession(ps, "liveness")
 	}()
 }
 
@@ -1125,7 +1151,7 @@ func (s *Server) servePeer(ps *peerSession) {
 				return
 			}
 			logger.Infof("server: AcceptStream(peer=%s) error - closing peer session: %v", ps.peerID, err)
-			s.removePeerSession(ps.peerID, "closed")
+			s.removePeerSession(ps, "closed")
 			return
 		}
 		s.wg.Add(1)
@@ -1147,7 +1173,7 @@ func (s *Server) establishPeerSession(ps *peerSession) bool {
 	}
 	// No isolated control plane: drive the handshake inline.
 	if !s.acceptHandshake(s.baseCtx, ps.session) {
-		s.removePeerSession(ps.peerID, "handshake failed")
+		s.removePeerSession(ps, "handshake failed")
 		return false
 	}
 	s.sessMu.RLock()
@@ -1176,7 +1202,7 @@ func (s *Server) waitPeerHandshake(ps *peerSession) bool {
 		}
 		return true
 	case <-done:
-		s.removePeerSession(ps.peerID, "closed")
+		s.removePeerSession(ps, "closed")
 		return false
 	}
 }
