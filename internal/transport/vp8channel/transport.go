@@ -199,9 +199,13 @@ type streamTransport struct {
 
 	// Multi-peer support: when onPeerData is set, each remote epoch gets
 	// its own KCP runtime and data is routed via onPeerData(peerID, ...).
-	peersMu sync.RWMutex
-	peers   map[uint32]*kcpRuntime // data epoch → KCP runtime
-	peerOut map[uint32]chan []byte // data epoch → outbound queue
+	// ai-generated: bounded retired-epoch fence, guarded by peersMu.
+	retiredPeers map[uint32]struct{}
+	retiredOrder []uint32
+	retiredNext  int
+	peersMu      sync.RWMutex
+	peers        map[uint32]*kcpRuntime // data epoch → KCP runtime
+	peerOut      map[uint32]chan []byte // data epoch → outbound queue
 
 	// Per-peer control plane: keyed by data epoch (= controlEpoch &^ controlEpochFlag).
 	// Each entry owns its own KCP session so multiple clients get independent
@@ -561,20 +565,8 @@ func (p *streamTransport) Close() error {
 			crt.close()
 		}
 
-		p.peersMu.Lock()
-		for _, prt := range p.peers {
-			prt.close()
-		}
-		p.peers = make(map[uint32]*kcpRuntime)
-		p.peerOut = make(map[uint32]chan []byte)
-		p.peersMu.Unlock()
-
-		p.ctrlPeersMu.Lock()
-		for _, pcp := range p.ctrlPeers {
-			pcp.kcp.close()
-		}
-		p.ctrlPeers = make(map[uint32]*peerControlKCP)
-		p.ctrlPeersMu.Unlock()
+		// ai-generated: detach peer maps before unblocking and closing their KCPs.
+		p.closePeerRuntimes()
 
 		if p.writerUp.Load() {
 			<-p.writerDone
@@ -1335,8 +1327,7 @@ func (p *streamTransport) handleControlFrame(src, dst uint32, kcpPayload []byte)
 // session so multiple clients can coexist in the same room.
 func (p *streamTransport) handlePeerFrame(peerEpoch uint32, kcpPayload []byte) {
 	if len(kcpPayload) == 0 {
-		// Keepalive - ensure peer is registered but nothing to deliver.
-		p.getOrCreatePeerKCP(peerEpoch)
+		// ai-generated: empty carrier beacons do not own a server session or KCP.
 		return
 	}
 
@@ -1348,6 +1339,12 @@ func (p *streamTransport) handlePeerFrame(peerEpoch uint32, kcpPayload []byte) {
 
 func (p *streamTransport) getOrCreatePeerKCP(epoch uint32) *kcpRuntime {
 	p.peersMu.RLock()
+	// ai-generated: retired epochs cannot recreate transport resources.
+	_, retired := p.retiredPeers[epoch]
+	if retired || p.closed.Load() {
+		p.peersMu.RUnlock()
+		return nil
+	}
 	rt := p.peers[epoch]
 	p.peersMu.RUnlock()
 	if rt != nil {
@@ -1357,6 +1354,10 @@ func (p *streamTransport) getOrCreatePeerKCP(epoch uint32) *kcpRuntime {
 	p.peersMu.Lock()
 	defer p.peersMu.Unlock()
 
+	// ai-generated: retirement may have won while upgrading the lock.
+	if _, retired := p.retiredPeers[epoch]; retired || p.closed.Load() {
+		return nil
+	}
 	// Double-check after acquiring write lock.
 	if rt = p.peers[epoch]; rt != nil {
 		return rt
@@ -1381,7 +1382,7 @@ func (p *streamTransport) getOrCreatePeerKCP(epoch uint32) *kcpRuntime {
 	logger.Infof("vp8channel: peer session created epoch=0x%08x", epoch)
 
 	// Pump outbound frames from this peer's queue into the writer.
-	go p.peerWriterPump(epoch, out)
+	go p.peerWriterPump(rt.conn.closed, out)
 
 	return rt
 }
@@ -1393,7 +1394,8 @@ func (p *streamTransport) getOrCreatePeerKCP(epoch uint32) *kcpRuntime {
 // queued) keeps the per-peer writes interleaved with the keyframe injection
 // below and lets batchSampleFrom coalesce segments into full samples. Stops
 // when the channel is closed or the transport shuts down.
-func (p *streamTransport) peerWriterPump(_ uint32, out chan []byte) {
+// ai-generated: end the per-peer ticker when its KCP is released.
+func (p *streamTransport) peerWriterPump(peerClosed <-chan struct{}, out chan []byte) {
 	ticker := time.NewTicker(p.frameInterval)
 	defer ticker.Stop()
 
@@ -1411,6 +1413,8 @@ func (p *streamTransport) peerWriterPump(_ uint32, out chan []byte) {
 	for {
 		select {
 		case <-p.closeCh:
+			return
+		case <-peerClosed:
 			return
 		case <-ticker.C:
 			ticksSinceKeyframe++
@@ -1502,6 +1506,12 @@ func (p *streamTransport) SetControlOnData(cb func([]byte)) {
 // creating one on demand. Outbound frames go via the shared controlOutbound
 // queue so writerLoop drains them with higher priority than bulk data.
 func (p *streamTransport) getOrCreatePeerControlKCP(dataEpoch uint32) *peerControlKCP {
+	// ai-generated: serialize control creation with retirement, data lock first.
+	p.peersMu.RLock()
+	defer p.peersMu.RUnlock()
+	if _, retired := p.retiredPeers[dataEpoch]; retired || p.closed.Load() {
+		return nil
+	}
 	p.ctrlPeersMu.RLock()
 	pck := p.ctrlPeers[dataEpoch]
 	p.ctrlPeersMu.RUnlock()
@@ -1550,7 +1560,13 @@ func (p *streamTransport) ControlSendTo(peerID string, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("vp8channel: invalid peerID %q: %w", peerID, err)
 	}
-	pck := p.getOrCreatePeerControlKCP(epoch)
+	// ai-generated: permit the existing control KCP to send the final CLOSE.
+	p.ctrlPeersMu.RLock()
+	pck := p.ctrlPeers[epoch]
+	p.ctrlPeersMu.RUnlock()
+	if pck == nil {
+		pck = p.getOrCreatePeerControlKCP(epoch)
+	}
 	if pck == nil {
 		return ErrTransportClosed
 	}
