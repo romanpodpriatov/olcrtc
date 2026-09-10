@@ -469,6 +469,11 @@ func (s *Server) establishPeerSession(peer *peerSession) bool {
 		_ = stream.Close()
 		return false
 	}
+	// This is the handshake path of transports that route peers without a
+	// per-peer control plane (datachannel over jitsi or livekit): the meter
+	// learns the session's key here, as acceptPeerHandshake does for the
+	// control-plane path.
+	s.meter.bind(result.sessionID, peer.group.KeyID())
 	s.startPeerControlLoop(ctx, peer, stream)
 	return true
 }

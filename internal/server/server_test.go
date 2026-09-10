@@ -834,6 +834,8 @@ func TestAcceptSingletonHandshakeStoresServerFields(t *testing.T) {
 
 	s := newHandshakeServer()
 	s.liveness = control.Config{Interval: time.Hour, Timeout: time.Hour, Failures: 1}
+	s.meter = newMeter()
+	s.group = muxconn.PrePinned(newServerTestKeys(t), "key-single")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer func() {
 		cancel()
@@ -859,6 +861,58 @@ func TestAcceptSingletonHandshakeStoresServerFields(t *testing.T) {
 	s.sessMu.RUnlock()
 	if dev != "device-B" {
 		t.Fatalf("stored deviceID = %q, want device-B", dev)
+	}
+	if got := meteredKey(s.meter, s.currentSessionID()); got != "key-single" {
+		t.Fatalf("meter bound the session to key %q, want key-single", got)
+	}
+}
+
+// meteredKey reports which key id the meter attributes sessionID to.
+func meteredKey(m *meter, sessionID string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sessionKey[sessionID]
+}
+
+// TestEstablishPeerSessionBindsTheMeterToThePinnedKey covers the handshake
+// path of peer-routing transports without a per-peer control plane
+// (datachannel over jitsi or livekit): the meter must learn the session's
+// key there too, or every byte of such a peer goes unattributed.
+func TestEstablishPeerSessionBindsTheMeterToThePinnedKey(t *testing.T) {
+	serverSess, clientSess, cleanup := smuxPair(t)
+	defer cleanup()
+
+	s := newHandshakeServer()
+	s.liveness = control.Config{Interval: time.Hour, Timeout: time.Hour, Failures: 1}
+	s.meter = newMeter()
+	ctx, cancel := context.WithCancel(context.Background())
+	s.baseCtx = ctx
+	defer func() {
+		cancel()
+		s.wg.Wait()
+	}()
+	keys := newServerTestKeys(t)
+	peer := newPeerSession("peer-x", false, muxconn.PrePinned(keys, "key-x"))
+	if !peer.attachData(muxconn.NewGrouped(&peerRoutingStub{}, peer.group), serverSess) {
+		t.Fatal("attachData() refused a fresh peer")
+	}
+
+	go func() {
+		stream, err := clientSess.OpenStream()
+		if err != nil {
+			return
+		}
+		_, _, _ = handshake.Client(stream, "device-C", nil)
+	}()
+
+	if !s.establishPeerSession(peer) {
+		t.Fatal("establishPeerSession() failed")
+	}
+	if peer.sid() == "" {
+		t.Fatal("establishPeerSession did not store the session id")
+	}
+	if got := meteredKey(s.meter, peer.sid()); got != "key-x" {
+		t.Fatalf("meter bound the peer's session to key %q, want key-x", got)
 	}
 }
 
