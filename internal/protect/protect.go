@@ -38,6 +38,14 @@ var (
 	sensitiveBearerRE = regexp.MustCompile(`(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+`)
 )
 
+// ErrProtectorRejected reports that the host protector refused a socket.
+//
+// This used to surface as net.ErrClosed, which prints "use of closed network
+// connection" - a protector that fails only for AF_INET6 then reads as an
+// unrelated bug in whatever was dialing. The network is in the OpError, so the
+// message now names both the cause and the family it happened on.
+var ErrProtectorRejected = errors.New("socket protector rejected the socket")
+
 type protectorHolder struct {
 	protect func(int) bool
 }
@@ -67,7 +75,7 @@ func controlFunc(network, _ string, c syscall.RawConn) error {
 	var err error
 	controlErr := c.Control(func(fd uintptr) {
 		if !current.protect(int(fd)) {
-			err = &net.OpError{Op: "protect", Net: network, Err: net.ErrClosed}
+			err = &net.OpError{Op: "protect", Net: network, Err: ErrProtectorRejected}
 		}
 	})
 	if controlErr != nil {
@@ -174,6 +182,14 @@ func isRetriableError(err error) bool {
 	}
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
+		return true
+	}
+	// No route is a statement about this instant, not about the host: the
+	// link is still coming up, the phone is mid-handover, or the socket was
+	// pinned to an interface that had nothing behind it. It used to be the one
+	// dial error that ended the request on the first try, which on a mobile
+	// carrier is the difference between connecting and not.
+	if errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) {
 		return true
 	}
 	var opErr *net.OpError
