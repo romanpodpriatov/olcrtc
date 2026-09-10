@@ -389,6 +389,7 @@ func (s *Server) acceptPeerHandshake(ctx context.Context, peer *peerSession) {
 			_ = stream.Close()
 			return
 		}
+		s.meter.bind(sessionID, peer.group.KeyID())
 		peer.signalReady()
 		s.health.RecordSession(sessionID)
 		s.onOpen(sessionID, hello.DeviceID, hello.Claims)

@@ -214,6 +214,13 @@ video:
 	}
 }
 
+func TestApplyMapsStatsListen(t *testing.T) {
+	got := Apply(File{Mode: testModeSrv, Stats: Stats{Listen: "127.0.0.1:9464"}})
+	if got.StatsListen != "127.0.0.1:9464" {
+		t.Fatalf("StatsListen = %q, want the stats.listen value", got.StatsListen)
+	}
+}
+
 func TestLoadCryptoKeysListAndFile(t *testing.T) {
 	dir := t.TempDir()
 	ring := []string{

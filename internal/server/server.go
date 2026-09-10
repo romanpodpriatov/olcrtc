@@ -5,14 +5,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/xtaci/smux"
 
 	"github.com/openlibrecommunity/olcrtc/internal/control"
 	"github.com/openlibrecommunity/olcrtc/internal/crypto"
 	"github.com/openlibrecommunity/olcrtc/internal/handshake"
+	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
 	"github.com/openlibrecommunity/olcrtc/internal/protect"
 	"github.com/openlibrecommunity/olcrtc/internal/runtime"
@@ -20,7 +23,11 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/tunnelcore"
 )
 
-const connectCommand = "connect"
+const (
+	connectCommand = "connect"
+	// statsReadHeaderTimeout bounds a slow client of the loopback /stats listener.
+	statsReadHeaderTimeout = 5 * time.Second
+)
 
 var (
 	ErrKeyRequired         = runtime.ErrKeyRequired
@@ -75,6 +82,10 @@ type Server struct {
 	deviceID      string
 	sessionID     string
 
+	// meter attributes stream bytes to the pinned key of their session for
+	// the /stats endpoint.
+	meter *meter
+
 	dnsServer      string
 	resolver       protect.Lookup
 	socksProxyAddr string
@@ -98,7 +109,10 @@ type Config struct {
 	// Keys is a ring of 64-hex keys the server accepts a peer under; the key
 	// that opens a peer's first record is pinned for that peer. Empty means
 	// the single KeyHex.
-	Keys             []string
+	Keys []string
+	// StatsListen, when set, serves GET /stats on this loopback address with
+	// per-key byte totals. Empty disables the listener.
+	StatsListen      string
 	DNSServer        string
 	Resolver         protect.Lookup
 	SOCKSProxyAddr   string
@@ -150,12 +164,15 @@ func Run(ctx context.Context, cfg Config) error {
 		socksProxyUser: cfg.SOCKSProxyUser, socksProxyPass: cfg.SOCKSProxyPass,
 		liveness: cfg.Liveness, health: runtime.NewHealthTracker(cfg.OnHealth),
 		peerSessions: make(map[string]*peerSession), peerStats: make(map[string]peerStat),
-		done: make(chan struct{}),
+		done: make(chan struct{}), meter: newMeter(),
 	}
 	defer func() {
 		s.shutdown()
 		s.wg.Wait()
 	}()
+	if cfg.StatsListen != "" {
+		s.serveStats(runCtx, cfg.StatsListen)
+	}
 	if err := s.bringUpLink(runCtx, cfg, cancel); err != nil {
 		return err
 	}
@@ -165,6 +182,27 @@ func Run(ctx context.Context, cfg Config) error {
 	}()
 	s.serve(runCtx)
 	return nil
+}
+
+// serveStats exposes per-key byte totals on a loopback endpoint an operator's
+// agent polls. Best effort: a bind failure logs and leaves the meter in
+// memory only, never blocking the tunnel. The listener closes with ctx.
+func (s *Server) serveStats(ctx context.Context, addr string) {
+	statsSrv := &http.Server{
+		Addr:              addr,
+		Handler:           s.meter.statsHandler(),
+		ReadHeaderTimeout: statsReadHeaderTimeout,
+	}
+	go func() {
+		logger.Infof("stats: serving /stats on %s", addr)
+		if err := statsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Warnf("stats: server on %s stopped: %v", addr, err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		_ = statsSrv.Close()
+	}()
 }
 
 // setupRing builds the candidate ring: cfg.Keys when given, else the single

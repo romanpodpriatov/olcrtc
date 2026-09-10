@@ -159,6 +159,8 @@ type Config struct {
 	TrafficMinDelay       string
 	TrafficMaxDelay       string
 	Amount                int
+	// StatsListen is the server's loopback /stats address; empty disables it.
+	StatsListen string
 }
 
 // RegisterDefaults registers built-in providers and transports.

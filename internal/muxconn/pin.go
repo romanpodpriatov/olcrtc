@@ -63,9 +63,12 @@ func (g *PinGroup) Pinned() *crypto.RingEntry {
 	return g.pinned.Load()
 }
 
-// KeyID returns the pinned key's metering id: "" while unpinned, or for a
-// PrePinned group built without one.
+// KeyID returns the pinned key's metering id: "" while unpinned, for a
+// PrePinned group built without one, or for a nil group.
 func (g *PinGroup) KeyID() string {
+	if g == nil {
+		return ""
+	}
 	if e := g.pinned.Load(); e != nil {
 		return e.KeyID
 	}

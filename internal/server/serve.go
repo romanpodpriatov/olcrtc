@@ -183,6 +183,7 @@ func (s *Server) acceptSingletonHandshake(ctx context.Context, session *smux.Ses
 	s.sessMu.Lock()
 	s.deviceID = result.deviceID
 	s.sessionID = result.sessionID
+	s.meter.bind(result.sessionID, s.group.KeyID())
 	s.sessMu.Unlock()
 	s.state.broadcast()
 	s.startControlLoop(ctx, session, stream)

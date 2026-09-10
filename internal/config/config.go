@@ -70,6 +70,13 @@ type File struct {
 	Failover Failover  `yaml:"failover"`
 	Data     string    `yaml:"data"`
 	Debug    bool      `yaml:"debug"`
+	Stats    Stats     `yaml:"stats"`
+}
+
+// Stats configures the server's loopback /stats listener. It is process-wide
+// like data, so it lives on the file rather than on a profile.
+type Stats struct {
+	Listen string `yaml:"listen"` // loopback host:port serving GET /stats; empty disables
 }
 
 // Profile is a failover entry that overrides top-level runtime fields.
@@ -347,6 +354,7 @@ func Apply(file File) session.Config {
 	cfg := ApplySettings(session.Config{}, file.Settings)
 	cfg.Mode = file.Mode
 	cfg.Amount = file.Gen.Amount
+	cfg.StatsListen = file.Stats.Listen
 
 	return cfg
 }

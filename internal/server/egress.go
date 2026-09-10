@@ -58,6 +58,7 @@ func (s *Server) dispatch(ctx context.Context, stream *smux.Stream, request Conn
 		return
 	}
 	counts, _ := tunnelcore.CopyBidirectional(ctx, stream, conn)
+	s.meter.add(sessionID, counts.LeftToRight, counts.RightToLeft)
 	if s.onTraffic != nil {
 		s.onTraffic(sessionID, addr, counts.LeftToRight, counts.RightToLeft)
 	}
