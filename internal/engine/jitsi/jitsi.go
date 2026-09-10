@@ -41,7 +41,17 @@ import (
 )
 
 const (
-	defaultSendQueueSize = 5000
+	// defaultSendQueueSize bounds what waits for the bridge, per destination.
+	// At the ~5 Mbit/s a JVB relay carries, 32 frames of 16 KB is under a
+	// second of queue. Control pings and pongs share this path with bulk
+	// data, and a pong that waits longer than the liveness timeout is a
+	// session torn down. The old 5000 was minutes of queue, and a full queue
+	// was an error that closed smux at once (olcbox #15).
+	defaultSendQueueSize = 32
+	// peerQueueIdle is how long an untouched per-peer queue lives. Peer IDs
+	// are data epochs, so a client that reconnects arrives under a new one;
+	// on a server that runs for days the map would otherwise only grow.
+	peerQueueIdle = time.Minute
 	// bridgeMaxMessageSize is the practical upper bound on a single colibri-ws
 	// payload. JVB enforces a max-message-size around 16 KiB; payloads above
 	// that cause the bridge to drop the websocket. The default datachannel
@@ -96,8 +106,6 @@ var vp8Keepalive = []byte{ //nolint:gochecknoglobals // protocol constant
 var (
 	// ErrSessionClosed is returned when an operation is attempted on a closed session.
 	ErrSessionClosed = errors.New("jitsi session closed")
-	// ErrSendQueueFull is returned when the outbound queue cannot accept more data.
-	ErrSendQueueFull = errors.New("jitsi send queue full")
 	// ErrBridgeNotReady is returned when send is attempted before the bridge is open.
 	ErrBridgeNotReady = errors.New("jitsi bridge not ready")
 	// ErrSendTooLarge is returned when a single payload exceeds the JVB max-message-size limit.
@@ -131,11 +139,16 @@ type Session struct {
 	pcCtx    context.Context    //nolint:containedctx // tied to PC lifetime, cancelled in teardownPC
 	pcCancel context.CancelFunc // cancels pcCtx; cancelled when the live PC is replaced
 
-	sendQueue     chan []byte
-	peerSendQueue chan bridgeOutbound
-	bridgeReady   atomic.Bool
-	closed        atomic.Bool
-	reconnecting  atomic.Bool
+	sendQueue chan []byte
+	// peerQueues holds one bounded queue per addressed peer, so a client that
+	// cannot drain its share does not hold the room's other clients behind
+	// it. peerWake is buffered(1): "some peer queue has data".
+	peerQueueMu  sync.Mutex
+	peerQueues   map[string]*peerQueue
+	peerWake     chan struct{}
+	bridgeReady  atomic.Bool
+	closed       atomic.Bool
+	reconnecting atomic.Bool
 
 	reconnectCh          chan struct{}
 	reconnectMu          sync.Mutex // guards reconnectWindowStart, reconnectCount, lastReconnectAt
@@ -175,9 +188,13 @@ type Session struct {
 	peerVideoSSRC atomic.Uint32
 }
 
-type bridgeOutbound struct {
-	to   string
-	data []byte
+// peerQueue is one peer's share of the bridge, with the bookkeeping that
+// lets it be dropped safely: refs counts senders that hold the channel and
+// may still push into it, lastUsed is when it last took a frame.
+type peerQueue struct {
+	ch       chan []byte
+	refs     int
+	lastUsed time.Time
 }
 
 // New creates a new Jitsi engine session.
@@ -211,7 +228,8 @@ func New(_ context.Context, cfg engine.Config) (engine.Session, error) {
 		onPeerData:          cfg.OnPeerData,
 		requireTargetedPeer: cfg.RequireTargetedPeer,
 		sendQueue:           make(chan []byte, defaultSendQueueSize),
-		peerSendQueue:       make(chan bridgeOutbound, defaultSendQueueSize),
+		peerQueues:          make(map[string]*peerQueue),
+		peerWake:            make(chan struct{}, 1),
 		peerEpochs:          make(map[string]uint32),
 		reconnectCh:         make(chan struct{}, 1),
 		done:                make(chan struct{}),
@@ -1106,13 +1124,14 @@ func (s *Session) enqueueBridgeFrame(framed []byte) error {
 	if len(framed) > bridgeMaxMessageSize {
 		return ErrSendTooLarge
 	}
+	// Wait for room: a full queue is back-pressure for smux, not a failure.
+	// The writer slows down, the session stays up, and control frames behind
+	// it wait at most one queue's worth.
 	select {
 	case s.sendQueue <- framed:
 		return nil
 	case <-s.done:
 		return ErrSessionClosed
-	default:
-		return ErrSendQueueFull
 	}
 }
 
@@ -1126,13 +1145,42 @@ func (s *Session) enqueuePeerBridgeFrame(peerID string, framed []byte) error {
 	if len(framed) > bridgeMaxMessageSize {
 		return ErrSendTooLarge
 	}
+	pq := s.peerQueueFor(peerID)
+	defer s.releasePeerQueue(pq)
 	select {
-	case s.peerSendQueue <- bridgeOutbound{to: peerID, data: framed}:
+	case pq.ch <- framed:
+		s.wakePeerSender()
 		return nil
 	case <-s.done:
 		return ErrSessionClosed
+	}
+}
+
+// peerQueueFor returns the peer's queue with a reference held; the caller
+// releases it once its frame is in (or the session is gone).
+func (s *Session) peerQueueFor(peerID string) *peerQueue {
+	s.peerQueueMu.Lock()
+	defer s.peerQueueMu.Unlock()
+	pq := s.peerQueues[peerID]
+	if pq == nil {
+		pq = &peerQueue{ch: make(chan []byte, defaultSendQueueSize)}
+		s.peerQueues[peerID] = pq
+	}
+	pq.refs++
+	pq.lastUsed = time.Now()
+	return pq
+}
+
+func (s *Session) releasePeerQueue(pq *peerQueue) {
+	s.peerQueueMu.Lock()
+	pq.refs--
+	s.peerQueueMu.Unlock()
+}
+
+func (s *Session) wakePeerSender() {
+	select {
+	case s.peerWake <- struct{}{}:
 	default:
-		return ErrSendQueueFull
 	}
 }
 
@@ -1147,11 +1195,60 @@ func (s *Session) sendLoop() {
 				return
 			}
 			s.sendBridgeFrame("", data)
-		case frame, ok := <-s.peerSendQueue:
-			if !ok {
+		case <-s.peerWake:
+			s.drainPeerQueues()
+		}
+	}
+}
+
+// drainPeerQueues sends one frame per peer per pass, round-robin, until
+// every peer queue is empty, serving the broadcast queue between passes so
+// a busy room does not starve it. Queues nobody has touched for
+// peerQueueIdle and nobody holds are dropped at the end.
+func (s *Session) drainPeerQueues() {
+	for {
+		s.peerQueueMu.Lock()
+		peers := make([]string, 0, len(s.peerQueues))
+		queues := make([]*peerQueue, 0, len(s.peerQueues))
+		for id, pq := range s.peerQueues {
+			peers = append(peers, id)
+			queues = append(queues, pq)
+		}
+		s.peerQueueMu.Unlock()
+
+		progressed := false
+		for i, pq := range queues {
+			select {
+			case <-s.done:
 				return
+			default:
 			}
-			s.sendBridgeFrame(frame.to, frame.data)
+			select {
+			case data := <-pq.ch:
+				s.sendBridgeFrame(peers[i], data)
+				progressed = true
+			default:
+			}
+			select {
+			case data := <-s.sendQueue:
+				s.sendBridgeFrame("", data)
+			default:
+			}
+		}
+		if !progressed {
+			s.reapPeerQueues()
+			return
+		}
+	}
+}
+
+func (s *Session) reapPeerQueues() {
+	cutoff := time.Now().Add(-peerQueueIdle)
+	s.peerQueueMu.Lock()
+	defer s.peerQueueMu.Unlock()
+	for id, pq := range s.peerQueues {
+		if pq.refs == 0 && len(pq.ch) == 0 && pq.lastUsed.Before(cutoff) {
+			delete(s.peerQueues, id)
 		}
 	}
 }
@@ -1877,13 +1974,32 @@ func (s *Session) drainReconnectQueue() {
 	}
 }
 
+// drainSendQueue empties every queue in place. In place matters: a sender
+// blocked on a full queue holds that very channel, and only room in it
+// (or the session ending) lets the sender go.
 func (s *Session) drainSendQueue() {
 	for {
 		select {
 		case <-s.sendQueue:
-		case <-s.peerSendQueue:
+			continue
 		default:
-			return
+		}
+		break
+	}
+	s.peerQueueMu.Lock()
+	queues := make([]*peerQueue, 0, len(s.peerQueues))
+	for _, pq := range s.peerQueues {
+		queues = append(queues, pq)
+	}
+	s.peerQueueMu.Unlock()
+	for _, pq := range queues {
+		for {
+			select {
+			case <-pq.ch:
+				continue
+			default:
+			}
+			break
 		}
 	}
 }
