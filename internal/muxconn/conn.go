@@ -146,8 +146,11 @@ type Conn struct {
 	ln      transport.Transport
 	send    func([]byte) error
 	canSend func() bool // if nil, uses ln.CanSend
-	keys    *crypto.KeySet
-	aad     []byte
+	// group carries the candidate ring and the pin decision, shared with
+	// every conn of the same peer. Single-key callers pass a PrePinned
+	// group, which keeps the single-key behaviour exact.
+	group *PinGroup
+	aad   []byte
 
 	in        chan *[]byte
 	closeOnce sync.Once
@@ -183,10 +186,15 @@ func (c *Conn) sendDeadline() time.Duration {
 // New wires a Conn over the given transport. Push must be set as the
 // transport's OnData callback before this conn is used.
 func New(ln transport.Transport, keys *crypto.KeySet) *Conn {
+	return NewGrouped(ln, PrePinned(keys, ""))
+}
+
+// NewGrouped is New with an explicit pin group (multi-key server paths).
+func NewGrouped(ln transport.Transport, g *PinGroup) *Conn {
 	return &Conn{
 		ln:      ln,
 		send:    ln.Send,
-		keys:    keys,
+		group:   g,
 		aad:     []byte(dataRecordAAD),
 		in:      make(chan *[]byte, inboundQueue),
 		closeCh: make(chan struct{}),
@@ -197,6 +205,11 @@ func New(ln transport.Transport, keys *crypto.KeySet) *Conn {
 // control-plane channel (transport.ControlPlane). Returns nil if the
 // transport does not implement ControlPlane.
 func NewControl(ln transport.Transport, keys *crypto.KeySet) *Conn {
+	return NewControlGrouped(ln, PrePinned(keys, ""))
+}
+
+// NewControlGrouped is NewControl with an explicit pin group.
+func NewControlGrouped(ln transport.Transport, g *PinGroup) *Conn {
 	cp, ok := ln.(transport.ControlPlane)
 	if !ok {
 		return nil
@@ -205,7 +218,7 @@ func NewControl(ln transport.Transport, keys *crypto.KeySet) *Conn {
 		ln:      ln,
 		send:    cp.ControlSend,
 		canSend: cp.ControlCanSend,
-		keys:    keys,
+		group:   g,
 		aad:     []byte(controlRecordAAD),
 		in:      make(chan *[]byte, inboundQueue),
 		closeCh: make(chan struct{}),
@@ -216,12 +229,17 @@ func NewControl(ln transport.Transport, keys *crypto.KeySet) *Conn {
 
 // NewPeer wires a Conn whose writes are addressed to a specific transport peer.
 func NewPeer(ln transport.PeerTransport, keys *crypto.KeySet, peerID string) *Conn {
+	return NewPeerGrouped(ln, PrePinned(keys, ""), peerID)
+}
+
+// NewPeerGrouped is NewPeer with an explicit pin group.
+func NewPeerGrouped(ln transport.PeerTransport, g *PinGroup, peerID string) *Conn {
 	return &Conn{
 		ln: ln,
 		send: func(data []byte) error {
 			return ln.SendTo(peerID, data)
 		},
-		keys:    keys,
+		group:   g,
 		aad:     []byte(dataRecordAAD),
 		in:      make(chan *[]byte, inboundQueue),
 		closeCh: make(chan struct{}),
@@ -237,6 +255,11 @@ func NewPeer(ln transport.PeerTransport, keys *crypto.KeySet, peerID string) *Co
 // SetControlOnPeerData callback covering every peer, so registering here
 // would clobber the caller's demultiplexer - hence the name.
 func NewPeerControlUnbound(ln transport.Transport, keys *crypto.KeySet, peerID string) *Conn {
+	return NewPeerControlUnboundGrouped(ln, PrePinned(keys, ""), peerID)
+}
+
+// NewPeerControlUnboundGrouped is NewPeerControlUnbound with an explicit pin group.
+func NewPeerControlUnboundGrouped(ln transport.Transport, g *PinGroup, peerID string) *Conn {
 	cp, ok := ln.(transport.PeerControlPlane)
 	if !ok {
 		return nil
@@ -249,13 +272,16 @@ func NewPeerControlUnbound(ln transport.Transport, keys *crypto.KeySet, peerID s
 		canSend: func() bool {
 			return cp.ControlPeerCanSend(peerID)
 		},
-		keys:    keys,
+		group:   g,
 		aad:     []byte(controlRecordAAD),
 		in:      make(chan *[]byte, inboundQueue),
 		closeCh: make(chan struct{}),
 	}
 	return c
 }
+
+// Group exposes the conn's pin group (metering reads the pinned key id).
+func (c *Conn) Group() *PinGroup { return c.group }
 
 // Push hands an encrypted wire payload (one OnData event) to the conn.
 //
@@ -266,7 +292,21 @@ func NewPeerControlUnbound(ln transport.Transport, keys *crypto.KeySet, peerID s
 // also bail on closeCh.
 func (c *Conn) Push(ciphertext []byte) {
 	bufPtr := acquireFrameBuf()
-	pt, err := c.keys.OpenInto(*bufPtr, ciphertext, c.aad)
+	var (
+		pt  []byte
+		err error
+	)
+	if entry := c.group.Pinned(); entry != nil {
+		pt, err = entry.Keys.OpenInto(*bufPtr, ciphertext, c.aad)
+	} else {
+		// Pairing is still open: the first record any ring entry opens
+		// becomes the pin for this conn's whole group (data and control).
+		var matched *crypto.RingEntry
+		pt, matched, err = c.group.ring.TryOpen(*bufPtr, ciphertext, c.aad)
+		if err == nil {
+			c.group.pin(matched)
+		}
+	}
 	if err != nil {
 		releaseFrameBuf(bufPtr)
 		c.noteDecryptFailure(len(ciphertext), err)
@@ -292,7 +332,7 @@ func (c *Conn) noteDecryptFailure(size int, err error) {
 	switch {
 	case errors.Is(err, crypto.ErrBadRecordMagic), errors.Is(err, crypto.ErrRecordTooShort):
 		c.badMagic.Add(1)
-	case errors.Is(err, crypto.ErrAuthentication):
+	case errors.Is(err, crypto.ErrAuthentication), errors.Is(err, crypto.ErrNoRingMatch):
 		c.authFailed.Add(1)
 	}
 	total := c.decryptFails.Add(1)
@@ -405,13 +445,23 @@ func (c *Conn) recycleIfDrained() {
 }
 
 // Write encrypts p and ships it to the link as a single message. Blocks while
-// the link signals back-pressure, up to writeReadyTimeout.
+// the link signals back-pressure, up to writeReadyTimeout, and until the
+// group knows which key the peer holds.
 func (c *Conn) Write(p []byte) (int, error) {
 	if err := c.waitSendReady(); err != nil {
 		return 0, err
 	}
-
-	enc, err := c.keys.SealInto(nil, p, c.aad)
+	// Sealing under a guessed key would hand the peer a frame it silently
+	// drops and desynchronise the smux stream, so wait for the pin. A
+	// pre-pinned group makes this free; an unpinned one is released by the
+	// peer's first record or by Close (smux closes the conn when its
+	// keepalive times out, so a peer that never speaks cannot park us).
+	select {
+	case <-c.group.PinWait():
+	case <-c.closeCh:
+		return 0, ErrClosed
+	}
+	enc, err := c.group.Pinned().Keys.SealInto(nil, p, c.aad)
 	if err != nil {
 		return 0, fmt.Errorf("encrypt: %w", err)
 	}

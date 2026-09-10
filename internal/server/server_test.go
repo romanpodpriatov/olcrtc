@@ -311,7 +311,7 @@ func TestShutdownClosesLinkAndConn(t *testing.T) {
 	ln := &serverLinkStub{}
 	s := &Server{
 		ln:   ln,
-		keys: keys,
+		ring: cryptopkg.SingleEntry(keys, ""),
 		conn: muxconn.New(ln, keys),
 	}
 	s.shutdown()
@@ -447,7 +447,7 @@ func TestReinstallSessionFiresOnClose(t *testing.T) {
 	}
 	s := &Server{
 		ln:        &serverLinkStub{},
-		keys:      keys,
+		ring:      cryptopkg.SingleEntry(keys, ""),
 		sessionID: "sid-123",
 		deviceID:  "dev-123",
 		onClose:   func(sid, reason string) { got.sid = sid; got.reason = reason },
@@ -573,7 +573,7 @@ func TestStartControlLoopResetsPeerBeforeReinstall(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
 		ln:      ln,
-		keys:    keys,
+		ring:    cryptopkg.SingleEntry(keys, ""),
 		conn:    muxconn.New(ln, keys),
 		session: serverSess,
 		health:  runtime.NewHealthTracker(nil),
@@ -741,7 +741,7 @@ func TestReinstallSessionClosesOldConnBeforeSwap(t *testing.T) {
 	}
 	s := &Server{
 		ln:           ln,
-		keys:         keys,
+		ring:         cryptopkg.SingleEntry(keys, ""),
 		conn:         conn,
 		session:      sess,
 		onClose:      func(string, string) {},
@@ -872,7 +872,7 @@ func TestPeerSessionConcurrentAccess(t *testing.T) {
 	ln := &serverLinkStub{}
 	s := &Server{
 		ln:           ln,
-		keys:         keys,
+		ring:         cryptopkg.SingleEntry(keys, ""),
 		onClose:      func(string, string) {},
 		health:       runtime.NewHealthTracker(nil),
 		peerSessions: make(map[string]*peerSession),
@@ -1061,7 +1061,7 @@ func TestServeSingleWakesOnSessionInstall(t *testing.T) {
 	keys := newServerTestKeys(t)
 	s := &Server{
 		ln:           &serverLinkStub{},
-		keys:         keys,
+		ring:         cryptopkg.SingleEntry(keys, ""),
 		sessionID:    "sid-serve",
 		resolver:     net.DefaultResolver,
 		onClose:      func(string, string) {},
