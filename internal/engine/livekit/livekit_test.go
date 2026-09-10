@@ -24,6 +24,8 @@ type fakeRoom struct {
 	mu           sync.Mutex
 	state        lksdk.ConnectionState
 	published    [][]byte
+	datagrams    [][]byte
+	datagramPeer []string
 	tracks       int
 	unpublished  int
 	disconnected int
@@ -37,6 +39,14 @@ func (r *fakeRoom) publishData(data []byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.published = append(r.published, append([]byte(nil), data...))
+	return nil
+}
+
+func (r *fakeRoom) publishDatagram(data []byte, peerID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.datagrams = append(r.datagrams, append([]byte(nil), data...))
+	r.datagramPeer = append(r.datagramPeer, peerID)
 	return nil
 }
 
@@ -410,4 +420,93 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func userPacket(topic string, data []byte) *lksdk.UserDataPacket {
+	packet := lksdk.UserData(data)
+	packet.Topic = topic
+	return packet
+}
+
+func TestDatagramSendAndReceive(t *testing.T) {
+	ctx := context.Background()
+	gotData := make(chan string, 1)
+	gotDatagram := make(chan string, 1)
+	gotPeerDatagram := make(chan string, 1)
+	sess, err := New(ctx, engine.Config{
+		URL:            testOldURL,
+		Token:          testOldToken,
+		OnData:         func(data []byte) { gotData <- string(data) },
+		OnDatagram:     func(data []byte) { gotDatagram <- string(data) },
+		OnPeerDatagram: func(peerID string, data []byte) { gotPeerDatagram <- peerID + ":" + string(data) },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	s, ok := sess.(*Session)
+	if !ok {
+		t.Fatalf("New() returned %T, want *Session", sess)
+	}
+	connector := newFakeConnector()
+	s.connectRoom = connector.connect
+
+	if err := s.SendDatagram([]byte("early")); !errors.Is(err, ErrRoomNotConnected) {
+		t.Fatalf("SendDatagram() before Connect error = %v, want %v", err, ErrRoomNotConnected)
+	}
+	if err := s.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	if !s.DatagramCanSend() {
+		t.Fatal("DatagramCanSend() = false, want true")
+	}
+	if err := s.SendDatagram([]byte("udp")); err != nil {
+		t.Fatalf("SendDatagram() error = %v", err)
+	}
+	if err := s.SendDatagramTo("peer-a", []byte("direct")); err != nil {
+		t.Fatalf("SendDatagramTo() error = %v", err)
+	}
+
+	room := connector.room(0)
+	room.mu.Lock()
+	if got, want := len(room.datagrams), 2; got != want {
+		room.mu.Unlock()
+		t.Fatalf("datagram count = %d, want %d", got, want)
+	}
+	if string(room.datagrams[0]) != "udp" || room.datagramPeer[0] != "" ||
+		string(room.datagrams[1]) != "direct" || room.datagramPeer[1] != "peer-a" {
+		room.mu.Unlock()
+		t.Fatalf("datagrams = %q peers=%v", room.datagrams, room.datagramPeer)
+	}
+	room.mu.Unlock()
+
+	cb := connector.callback(0)
+	cb.OnDataPacket(userPacket(dataPublishTopic, []byte("tcp")), lksdk.DataReceiveParams{})
+	cb.OnDataPacket(userPacket(datagramPublishTopic, []byte("udp-in")), lksdk.DataReceiveParams{})
+	cb.OnDataPacket(userPacket(datagramPublishTopic, []byte("udp-peer")), lksdk.DataReceiveParams{
+		SenderIdentity: "peer-b",
+	})
+	if cb.OnDataReceived != nil {
+		t.Fatal("OnDataReceived is set next to OnDataPacket: every packet would arrive twice")
+	}
+
+	assertChanString(t, gotData, "tcp")
+	assertChanString(t, gotDatagram, "udp-in")
+	assertChanString(t, gotPeerDatagram, "peer-b:udp-peer")
+
+	_ = s.Close()
+	if err := s.SendDatagram([]byte("late")); !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("SendDatagram() after Close error = %v, want %v", err, ErrSessionClosed)
+	}
+}
+
+func assertChanString(t *testing.T, ch <-chan string, want string) {
+	t.Helper()
+	select {
+	case got := <-ch:
+		if got != want {
+			t.Fatalf("received %q, want %q", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %q", want)
+	}
 }

@@ -35,6 +35,14 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 		p.handleControlFrame(src, dst, kcpPayload)
 		return
 	}
+	if packets, ok := splitDatagramBatchPayload(kcpPayload); ok {
+		p.handleDatagramBatchFrame(src, packets)
+		return
+	}
+	if payload, ok := splitDatagramPayload(kcpPayload); ok {
+		p.handleDatagramFrame(src, payload)
+		return
+	}
 
 	if p.serverMode {
 		p.handlePeerFrame(src, kcpPayload)

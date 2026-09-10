@@ -76,6 +76,38 @@ func (p *streamTransport) sendTo(peerID string, data []byte) error {
 	return nil
 }
 
+// SendDatagram forwards an unordered, lossy payload to the engine's datagram
+// lane when it has one.
+func (p *streamTransport) SendDatagram(data []byte) error {
+	dg, ok := p.session.(engine.DatagramSession)
+	if !ok {
+		return transport.ErrDatagramUnsupported
+	}
+	if err := dg.SendDatagram(data); err != nil {
+		return fmt.Errorf("session send datagram: %w", err)
+	}
+	return nil
+}
+
+// SendDatagramTo forwards a lossy payload to a specific peer when the engine
+// can address one, and to the room otherwise.
+func (p *streamTransport) SendDatagramTo(peerID string, data []byte) error {
+	peer, ok := p.session.(engine.PeerDatagramSession)
+	if !ok {
+		return p.SendDatagram(data)
+	}
+	if err := peer.SendDatagramTo(peerID, data); err != nil {
+		return fmt.Errorf("session send datagram to peer: %w", err)
+	}
+	return nil
+}
+
+// DatagramCanSend reports whether the engine's datagram lane is writable.
+func (p *streamTransport) DatagramCanSend() bool {
+	dg, ok := p.session.(engine.DatagramSession)
+	return ok && dg.DatagramCanSend()
+}
+
 // PeerSeen implements transport.PeerObserver when the engine can answer it.
 func (p *streamTransport) PeerSeen() bool {
 	observer, ok := p.session.(transport.PeerObserver)
@@ -149,5 +181,6 @@ func (p *streamTransport) WaitForPeer(ctx context.Context) error {
 
 // Features describes the current datachannel transport semantics.
 func (p *streamTransport) Features() transport.Features {
-	return p.shaper.Features(transport.Features{MaxPayloadSize: defaultMaxPayloadSize})
+	_, datagram := p.session.(engine.DatagramSession)
+	return p.shaper.Features(transport.Features{MaxPayloadSize: defaultMaxPayloadSize, Datagram: datagram})
 }

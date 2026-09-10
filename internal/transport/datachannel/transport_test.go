@@ -45,6 +45,65 @@ func (s *stubSession) SubscriberCanSend() bool           { return s.canSend }
 func (s *stubSession) GetBufferedAmount() uint64         { return 0 }
 func (s *stubSession) Reconnect(string)                  {}
 
+type datagramStubSession struct {
+	*stubSession
+	datagramErr error
+	dgCanSend   bool
+	dgSent      []byte
+	dgPeer      string
+}
+
+func (s *datagramStubSession) SendDatagram(data []byte) error {
+	s.dgSent = append([]byte(nil), data...)
+	return s.datagramErr
+}
+
+func (s *datagramStubSession) SendDatagramTo(peerID string, data []byte) error {
+	s.dgPeer = peerID
+	return s.SendDatagram(data)
+}
+
+func (s *datagramStubSession) DatagramCanSend() bool { return s.dgCanSend }
+
+func TestDatagramDelegation(t *testing.T) {
+	sess := &datagramStubSession{stubSession: &stubSession{}, dgCanSend: true}
+	tr := &streamTransport{session: sess}
+	if !tr.Features().Datagram {
+		t.Fatal("Features().Datagram = false, want true")
+	}
+	if !tr.DatagramCanSend() {
+		t.Fatal("DatagramCanSend() = false, want true")
+	}
+	if err := tr.SendDatagram([]byte("udp")); err != nil {
+		t.Fatalf("SendDatagram() error = %v", err)
+	}
+	if string(sess.dgSent) != "udp" {
+		t.Fatalf("datagram sent = %q, want udp", sess.dgSent)
+	}
+	if err := tr.SendDatagramTo("peer-a", []byte("direct")); err != nil {
+		t.Fatalf("SendDatagramTo() error = %v", err)
+	}
+	if sess.dgPeer != "peer-a" || string(sess.dgSent) != "direct" {
+		t.Fatalf("peer datagram peer=%q sent=%q", sess.dgPeer, sess.dgSent)
+	}
+}
+
+func TestDatagramUnsupported(t *testing.T) {
+	tr := &streamTransport{session: &stubSession{}}
+	if tr.Features().Datagram {
+		t.Fatal("Features().Datagram = true, want false")
+	}
+	if tr.DatagramCanSend() {
+		t.Fatal("DatagramCanSend() = true, want false")
+	}
+	if err := tr.SendDatagram([]byte("udp")); !errors.Is(err, transport.ErrDatagramUnsupported) {
+		t.Fatalf("SendDatagram() error = %v, want %v", err, transport.ErrDatagramUnsupported)
+	}
+	if err := tr.SendDatagramTo("peer-a", []byte("udp")); !errors.Is(err, transport.ErrDatagramUnsupported) {
+		t.Fatalf("SendDatagramTo() error = %v, want %v", err, transport.ErrDatagramUnsupported)
+	}
+}
+
 type identitySession struct {
 	*stubSession
 	local     string

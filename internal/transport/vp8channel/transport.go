@@ -106,9 +106,11 @@ type streamTransport struct {
 	// reaches the track and to assert that writeSampleLocked serializes
 	// concurrent callers. It must consume data before returning, matching
 	// TrackLocalStaticSample.WriteSample. Always invoked under writeMu.
-	sampleWriter func([]byte) bool
-	onData       func([]byte)
-	onPeerData   func(peerID string, data []byte)
+	sampleWriter   func([]byte) bool
+	onData         func([]byte)
+	onPeerData     func(peerID string, data []byte)
+	onDatagram     func([]byte)
+	onPeerDatagram func(peerID string, data []byte)
 	// serverMode records which side of the link this is. The multi-peer
 	// (server) side keeps one session per remote epoch; the single-peer
 	// (client) side latches onto exactly one. Routing decisions read this
@@ -119,6 +121,9 @@ type streamTransport struct {
 	// Both are plain KCP planes with independent epochs and queues.
 	data    *kcpPlane
 	control *kcpPlane
+	// datagram is the lossy lane: whole frames the writer sends as they are,
+	// bypassing KCP, after control and before bulk data (see datagram.go).
+	datagram chan []byte
 
 	// onControlData / onPeerControlData are swapped in by the upper layer at
 	// any time and read on every received control frame, so they are atomic
@@ -225,7 +230,10 @@ func newStreamTransport(
 		track:            track,
 		onData:           cfg.OnData,
 		onPeerData:       cfg.OnPeerData,
+		onDatagram:       cfg.OnDatagram,
+		onPeerDatagram:   cfg.OnPeerDatagram,
 		serverMode:       cfg.OnPeerData != nil,
+		datagram:         make(chan []byte, datagramQueueSize),
 		closeCh:          make(chan struct{}),
 		writerDone:       make(chan struct{}),
 		frameInterval:    time.Second / time.Duration(opts.FPS),
@@ -377,6 +385,7 @@ func (p *streamTransport) Close() error {
 		p.data.close()
 		p.control.close()
 		p.peers.closeAll()
+		p.drainDatagramQueue()
 
 		if p.writerUp.Load() {
 			<-p.writerDone
@@ -464,5 +473,5 @@ func (p *streamTransport) CanSend() bool {
 
 // Features describes the current vp8channel transport semantics.
 func (p *streamTransport) Features() transport.Features {
-	return p.shaper.Features(transport.Features{MaxPayloadSize: defaultMaxPayloadSize})
+	return p.shaper.Features(transport.Features{MaxPayloadSize: defaultMaxPayloadSize, Datagram: true})
 }

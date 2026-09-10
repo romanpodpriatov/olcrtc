@@ -26,8 +26,11 @@ import (
 
 const (
 	dataPublishTopic = "olcrtc"
-	videoTrackName   = "videochannel"
-	maxReconnects    = 10
+	// datagramPublishTopic carries the lossy lane: unreliable data packets the
+	// receiver hands to OnDatagram instead of the byte stream.
+	datagramPublishTopic = "olcrtc.udp"
+	videoTrackName       = "videochannel"
+	maxReconnects        = 10
 
 	// leaveGrace is how long disconnect() lets the SFU act on our
 	// LEAVE_REQUEST before returning. See sdkRoom.disconnect.
@@ -55,6 +58,7 @@ var (
 
 type roomHandle interface {
 	publishData(data []byte) error
+	publishDatagram(data []byte, peerID string) error
 	publishTrack(track webrtc.TrackLocal) error
 	unpublishLocalTracks()
 	disconnect()
@@ -72,6 +76,20 @@ func (r *sdkRoom) publishData(data []byte) error {
 		lksdk.WithDataPublishReliable(true),
 	); err != nil {
 		return fmt.Errorf("publish data packet: %w", err)
+	}
+	return nil
+}
+
+func (r *sdkRoom) publishDatagram(data []byte, peerID string) error {
+	opts := []lksdk.DataPublishOption{
+		lksdk.WithDataPublishTopic(datagramPublishTopic),
+		lksdk.WithDataPublishReliable(false),
+	}
+	if peerID != "" {
+		opts = append(opts, lksdk.WithDataPublishDestination([]string{peerID}))
+	}
+	if err := r.room.LocalParticipant.PublishDataPacket(lksdk.UserData(data), opts...); err != nil {
+		return fmt.Errorf("publish datagram packet: %w", err)
 	}
 	return nil
 }
@@ -152,21 +170,25 @@ type Session struct {
 	engine.Reconnector
 	engine.VideoTrackState
 
-	url          string
-	token        string
-	name         string
-	refresh      func(ctx context.Context) (engine.Credentials, error)
-	connectRoom  connectRoomFunc
-	connectOpts  []lksdk.ConnectOption
-	room         roomHandle
-	roomMu       sync.RWMutex
-	onData       func([]byte)
-	closeCh      chan struct{}
-	sendQueue    chan []byte
-	closed       atomic.Bool
-	reconnecting atomic.Bool
-	done         chan struct{}
-	queuedBytes  atomic.Int64
+	url         string
+	token       string
+	name        string
+	refresh     func(ctx context.Context) (engine.Credentials, error)
+	connectRoom connectRoomFunc
+	connectOpts []lksdk.ConnectOption
+	room        roomHandle
+	roomMu      sync.RWMutex
+	onData      func([]byte)
+	onDatagram  func([]byte)
+	// onPeerDatagram, when set, receives datagrams with their sender's
+	// identity; a datagram whose sender is unknown falls back to onDatagram.
+	onPeerDatagram func(peerID string, data []byte)
+	closeCh        chan struct{}
+	sendQueue      chan []byte
+	closed         atomic.Bool
+	reconnecting   atomic.Bool
+	done           chan struct{}
+	queuedBytes    atomic.Int64
 	// roomReady overrides roomReadyTimeout. Zero means the default; only
 	// tests set it.
 	roomReady      time.Duration
@@ -211,10 +233,13 @@ func New(_ context.Context, cfg engine.Config) (engine.Session, error) {
 		connectRoom: connectSDKRoom,
 		connectOpts: connectOpts,
 		onData:      cfg.OnData,
-		closeCh:     make(chan struct{}),
-		sendQueue:   make(chan []byte, engine.DefaultSendQueueSize),
-		done:        make(chan struct{}),
+		onDatagram:  cfg.OnDatagram,
+		// onPeerDatagram is set below so the field list stays aligned.
+		closeCh:   make(chan struct{}),
+		sendQueue: make(chan []byte, engine.DefaultSendQueueSize),
+		done:      make(chan struct{}),
 	}
+	s.onPeerDatagram = cfg.OnPeerDatagram
 	s.Configure(engine.ReconnectorConfig{
 		MaxAttempts: maxReconnects,
 		Reconnect:   s.reconnect,
@@ -240,11 +265,7 @@ func (s *Session) Connect(ctx context.Context) error {
 func (s *Session) connectSession(_ context.Context) error {
 	roomCB := &lksdk.RoomCallback{
 		ParticipantCallback: lksdk.ParticipantCallback{
-			OnDataReceived: func(data []byte, _ lksdk.DataReceiveParams) {
-				if s.onData != nil {
-					s.onData(data)
-				}
-			},
+			OnDataPacket: s.handleDataPacket,
 			OnTrackSubscribed: func(track *webrtc.TrackRemote, _ *lksdk.RemoteTrackPublication, _ *lksdk.RemoteParticipant) {
 				if track.Kind() != webrtc.RTPCodecTypeVideo {
 					return
@@ -272,6 +293,29 @@ func (s *Session) connectSession(_ context.Context) error {
 
 	s.setRoom(room)
 	return s.publishPendingTracks()
+}
+
+// handleDataPacket routes a received user packet by topic: the datagram topic
+// feeds the lossy lane, everything else is the byte stream. The SDK's
+// OnDataReceived is its deprecated twin and stays unset so nothing is
+// delivered twice.
+func (s *Session) handleDataPacket(packet lksdk.DataPacket, params lksdk.DataReceiveParams) {
+	user, ok := packet.(*lksdk.UserDataPacket)
+	if !ok {
+		return
+	}
+	if user.Topic == datagramPublishTopic {
+		switch {
+		case s.onPeerDatagram != nil && params.SenderIdentity != "":
+			s.onPeerDatagram(params.SenderIdentity, user.Payload)
+		case s.onDatagram != nil:
+			s.onDatagram(user.Payload)
+		}
+		return
+	}
+	if s.onData != nil {
+		s.onData(user.Payload)
+	}
 }
 
 func (s *Session) publishPendingTracks() error {
@@ -364,6 +408,30 @@ func (s *Session) Send(data []byte) error {
 	default:
 		return ErrSendQueueFull
 	}
+}
+
+// SendDatagram publishes one unordered, lossy data packet to the room.
+func (s *Session) SendDatagram(data []byte) error {
+	return s.SendDatagramTo("", data)
+}
+
+// SendDatagramTo publishes one unordered, lossy data packet to a participant.
+// Datagrams skip the send queue: a packet that cannot go now is worth nothing
+// later, so an unconnected room refuses it instead of parking it.
+func (s *Session) SendDatagramTo(peerID string, data []byte) error {
+	if s.closed.Load() {
+		return ErrSessionClosed
+	}
+	room := s.currentRoom()
+	if room == nil || room.connectionState() != lksdk.ConnectionStateConnected {
+		return ErrRoomNotConnected
+	}
+	return room.publishDatagram(data, peerID)
+}
+
+// DatagramCanSend reports whether a datagram would be published now.
+func (s *Session) DatagramCanSend() bool {
+	return s.CanSend()
 }
 
 // Close terminates the session.

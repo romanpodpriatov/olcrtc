@@ -42,6 +42,27 @@ var ErrInvalidPeerID = errors.New("invalid peer id")
 // upper layers actually size their frames against (see runtime.MaxPayload).
 type Features struct {
 	MaxPayloadSize int
+	// Datagram reports whether the transport carries unordered, lossy
+	// datagrams next to the byte stream (see DatagramTransport).
+	Datagram bool
+}
+
+// ErrDatagramUnsupported is returned when a transport cannot send lossy datagrams.
+var ErrDatagramUnsupported = errors.New("transport does not support datagrams")
+
+// DatagramTransport is implemented by transports that can send unordered,
+// lossy datagrams independently of the reliable byte stream.
+type DatagramTransport interface {
+	Transport
+	SendDatagram(data []byte) error
+	DatagramCanSend() bool
+}
+
+// PeerDatagramTransport is implemented by datagram transports that can
+// address individual remote endpoints.
+type PeerDatagramTransport interface {
+	DatagramTransport
+	SendDatagramTo(peerID string, data []byte) error
 }
 
 // Transport defines a byte transport independent of the underlying provider.
@@ -208,10 +229,14 @@ type Config struct {
 	Name          string
 	OnData        func([]byte)
 	OnPeerData    func(peerID string, data []byte)
-	DNSServer     string
-	Resolver      protect.Lookup
-	ProxyAddr     string
-	ProxyPort     int
+	// OnDatagram and OnPeerDatagram receive the lossy datagram lane; a
+	// transport without one never calls them.
+	OnDatagram     func([]byte)
+	OnPeerDatagram func(peerID string, data []byte)
+	DNSServer      string
+	Resolver       protect.Lookup
+	ProxyAddr      string
+	ProxyPort      int
 
 	// RequireTargetedPeer makes single-peer engines ignore broadcast frames
 	// from unrelated olcrtc clients until a peer sends a frame addressed to
@@ -236,6 +261,8 @@ func (c Config) EngineConfig() enginebuiltin.Config {
 		Name:                c.Name,
 		OnData:              c.OnData,
 		OnPeerData:          c.OnPeerData,
+		OnDatagram:          c.OnDatagram,
+		OnPeerDatagram:      c.OnPeerDatagram,
 		DNSServer:           c.DNSServer,
 		Resolver:            c.Resolver,
 		ProxyAddr:           c.ProxyAddr,
