@@ -51,6 +51,7 @@ type Settings struct {
 	Liveness  Liveness  `yaml:"liveness"`
 	Lifecycle Lifecycle `yaml:"lifecycle"`
 	Traffic   Traffic   `yaml:"traffic"`
+	UDP       UDP       `yaml:"udp"`
 }
 
 // File is the on-disk YAML schema.
@@ -190,6 +191,17 @@ type Traffic struct {
 	MaxPayloadSize int    `yaml:"max_payload_size"`
 	MinDelay       string `yaml:"min_delay"`
 	MaxDelay       string `yaml:"max_delay"`
+}
+
+// UDP controls the lossy SOCKS5 UDP ASSOCIATE relay. The relay is off unless
+// the file opts in with `udp: { enabled: true }`, so a config without a udp
+// block behaves exactly as before the relay existed. `disabled: true` wins
+// over `enabled: true`. Pointers tell an absent key from a false one, which
+// lets a failover profile override only what it names.
+type UDP struct {
+	Enabled  *bool `yaml:"enabled"`
+	Disabled *bool `yaml:"disabled"`
+	MaxFlows *int  `yaml:"max_flows"`
 }
 
 // Gen controls room-generation mode.
@@ -349,9 +361,10 @@ func readKeyFile(configPath, keyFile string) (string, error) {
 	return key, nil
 }
 
-// Apply converts a parsed file into a session config.
+// Apply converts a parsed file into a session config. The UDP relay starts
+// off and only an explicit udp.enabled turns it on.
 func Apply(file File) session.Config {
-	cfg := ApplySettings(session.Config{}, file.Settings)
+	cfg := ApplySettings(session.Config{UDPDisabled: true}, file.Settings)
 	cfg.Mode = file.Mode
 	cfg.Amount = file.Gen.Amount
 	cfg.StatsListen = file.Stats.Listen
@@ -418,6 +431,16 @@ func ApplySettings(dst session.Config, s Settings) session.Config {
 
 	dst.TrafficMaxPayloadSize = overlay(dst.TrafficMaxPayloadSize, s.Traffic.MaxPayloadSize)
 	dst.TrafficMinDelay = overlay(dst.TrafficMinDelay, s.Traffic.MinDelay)
+
+	if s.UDP.Enabled != nil {
+		dst.UDPDisabled = !*s.UDP.Enabled
+	}
+	if s.UDP.Disabled != nil {
+		dst.UDPDisabled = dst.UDPDisabled || *s.UDP.Disabled
+	}
+	if s.UDP.MaxFlows != nil {
+		dst.UDPMaxFlows = *s.UDP.MaxFlows
+	}
 	dst.TrafficMaxDelay = overlay(dst.TrafficMaxDelay, s.Traffic.MaxDelay)
 
 	return dst

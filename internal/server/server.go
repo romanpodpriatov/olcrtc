@@ -86,6 +86,15 @@ type Server struct {
 	// the /stats endpoint.
 	meter *meter
 
+	// UDP relay state (see udp.go). udpPendingFlows counts flows being
+	// dialled so the cap holds while a dial is in flight.
+	unsafeAllowPrivateUDPTargets bool
+	udpDisabled                  bool
+	maxUDPFlows                  int
+	udpMu                        sync.Mutex
+	udpFlows                     map[serverUDPKey]*serverUDPFlow
+	udpPendingFlows              int
+
 	dnsServer      string
 	resolver       protect.Lookup
 	socksProxyAddr string
@@ -112,25 +121,31 @@ type Config struct {
 	Keys []string
 	// StatsListen, when set, serves GET /stats on this loopback address with
 	// per-key byte totals. Empty disables the listener.
-	StatsListen      string
-	DNSServer        string
-	Resolver         protect.Lookup
-	SOCKSProxyAddr   string
-	SOCKSProxyPort   int
-	SOCKSProxyUser   string
-	SOCKSProxyPass   string
-	TransportOptions transport.Options
-	Engine           string
-	URL              string
-	Token            string
-	ProviderToken    string
-	Liveness         control.Config
-	Traffic          transport.TrafficConfig
-	AuthHook         handshake.AuthFunc
-	OnSessionOpen    SessionOpenFunc
-	OnSessionClose   SessionCloseFunc
-	OnTraffic        TrafficFunc
-	OnHealth         HealthFunc
+	StatsListen string
+	// UDPDisabled turns the SOCKS5 UDP relay off; UDPMaxFlows caps concurrent
+	// flows (0 means the default). UnsafeAllowPrivateUDPTargets lets flows
+	// reach loopback, private and link-local targets; tests only.
+	UDPDisabled                  bool
+	UDPMaxFlows                  int
+	UnsafeAllowPrivateUDPTargets bool
+	DNSServer                    string
+	Resolver                     protect.Lookup
+	SOCKSProxyAddr               string
+	SOCKSProxyPort               int
+	SOCKSProxyUser               string
+	SOCKSProxyPass               string
+	TransportOptions             transport.Options
+	Engine                       string
+	URL                          string
+	Token                        string
+	ProviderToken                string
+	Liveness                     control.Config
+	Traffic                      transport.TrafficConfig
+	AuthHook                     handshake.AuthFunc
+	OnSessionOpen                SessionOpenFunc
+	OnSessionClose               SessionCloseFunc
+	OnTraffic                    TrafficFunc
+	OnHealth                     HealthFunc
 }
 
 // Run starts the server with the given configuration.
@@ -165,6 +180,9 @@ func Run(ctx context.Context, cfg Config) error {
 		liveness: cfg.Liveness, health: runtime.NewHealthTracker(cfg.OnHealth),
 		peerSessions: make(map[string]*peerSession), peerStats: make(map[string]peerStat),
 		done: make(chan struct{}), meter: newMeter(),
+		udpDisabled: cfg.UDPDisabled, maxUDPFlows: normalizeMaxUDPFlows(cfg.UDPMaxFlows),
+		unsafeAllowPrivateUDPTargets: cfg.UnsafeAllowPrivateUDPTargets,
+		udpFlows:                     make(map[serverUDPKey]*serverUDPFlow),
 	}
 	defer func() {
 		s.shutdown()

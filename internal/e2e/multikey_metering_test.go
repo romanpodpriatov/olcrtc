@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -46,7 +47,9 @@ func fetchStats(t *testing.T, addr string) server.StatsBody {
 // that key's id on /stats, and to nothing else.
 func TestMultiKeySecondRingKeyMetersFullStack(t *testing.T) {
 	echoAddr := startEchoServer(t)
-	tunnel := startRingTunnel(t, []string{testKeyHex, altKeyHex}, altKeyHex, true, 30*time.Second)
+	tunnel := startRingTunnel(t, ringTunnelSpec{
+		ring: []string{testKeyHex, altKeyHex}, clientKey: altKeyHex, withStats: true, readyBudget: 30 * time.Second,
+	})
 	if !tunnel.ready {
 		t.Fatal("client holding the second ring key never became ready")
 	}
@@ -76,5 +79,60 @@ func TestMultiKeySecondRingKeyMetersFullStack(t *testing.T) {
 	}
 	if stats.Total.Up < d.Up || stats.Total.Down < d.Down {
 		t.Fatalf("total below the per-key count: %+v", stats)
+	}
+}
+
+// TestMultiKeyUDPDatagramMetersByPinnedKeyFullStack proves the UDP relay's
+// metering contract: a client presenting the second ring key opens a SOCKS5
+// UDP ASSOCIATE, a datagram round-trips through the vp8channel datagram lane,
+// and the relayed bytes are attributed to that client's pinned key on /stats,
+// never to the first entry of the ring.
+func TestMultiKeyUDPDatagramMetersByPinnedKeyFullStack(t *testing.T) {
+	echoAddr := startUDPEchoServer(t)
+	tunnel := startRingTunnel(t, ringTunnelSpec{
+		ring: []string{testKeyHex, altKeyHex}, clientKey: altKeyHex, transport: transportVP8,
+		withStats: true, allowPrivateUDP: true, readyBudget: 30 * time.Second,
+	})
+	if !tunnel.ready {
+		t.Fatal("client holding the second ring key never became ready over vp8channel")
+	}
+
+	udpConn, tcpConn, relayAddr := connectViaSOCKSUDP(t, tunnel.socksAddr)
+	payload := []byte("olcrtc-udp-multikey")
+	if _, err := udpConn.WriteToUDP(buildSocksUDPPacket(t, echoAddr, payload), relayAddr); err != nil {
+		t.Fatalf("write socks udp packet: %v", err)
+	}
+	_ = udpConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	buf := make([]byte, 4096)
+	n, _, err := udpConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("read socks udp echo: %v", err)
+	}
+	if _, got := parseSocksUDPPacket(t, buf[:n]); !bytes.Equal(got, payload) {
+		t.Fatalf("udp echo = %q, want %q", got, payload)
+	}
+
+	// The meter counts a flow when it closes; tearing the association down
+	// sends the flow-close frames to the server.
+	_ = udpConn.Close()
+	_ = tcpConn.Close()
+
+	wantID := keyID(t, altKeyHex)
+	otherID := keyID(t, testKeyHex)
+	deadline := time.Now().Add(15 * time.Second)
+	var stats server.StatsBody
+	for time.Now().Before(deadline) {
+		stats = fetchStats(t, tunnel.statsAddr)
+		if d := stats.Keys[wantID]; d.Up > 0 && d.Down > 0 {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	d := stats.Keys[wantID]
+	if d.Up == 0 || d.Down == 0 {
+		t.Fatalf("UDP flow not metered to the pinned key %s: %+v", wantID, stats)
+	}
+	if leaked, ok := stats.Keys[otherID]; ok && (leaked.Up > 0 || leaked.Down > 0) {
+		t.Fatalf("UDP bytes leaked onto the unpaired ring key %s: %+v", otherID, stats)
 	}
 }

@@ -84,11 +84,16 @@ func (c *Client) handleSocks5(ctx context.Context, conn net.Conn) {
 	if err := c.socks5Handshake(conn); err != nil {
 		return
 	}
-	targetAddr, targetPort, err := c.socks5Request(conn)
+	req, err := c.readSocks5Request(conn)
 	if err != nil {
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
+	if req.cmd == socksCmdUDPAssociate {
+		c.handleUDPAssociate(ctx, conn, req)
+		return
+	}
+	targetAddr, targetPort := req.addr, req.port
 	const sessionReadyTimeout = 60 * time.Second
 	readyCtx, cancel := context.WithTimeout(ctx, sessionReadyTimeout)
 	defer cancel()
@@ -169,23 +174,36 @@ func (c *Client) socks5UserPassAuth(conn net.Conn) error {
 	return nil
 }
 
+// socks5Request reads a CONNECT request; any other command is refused.
 func (c *Client) socks5Request(conn net.Conn) (string, int, error) {
-	header := make([]byte, 4)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		return "", 0, fmt.Errorf("read socks5 request: %w", err)
-	}
-	if header[1] != 1 {
-		return "", 0, fmt.Errorf("%w: %d", ErrUnsupportedSOCKSCommand, header[1])
-	}
-	addr, err := c.readSocks5Addr(conn, header[3])
+	req, err := c.readSocks5Request(conn)
 	if err != nil {
 		return "", 0, err
 	}
+	if req.cmd != socksCmdConnect {
+		return "", 0, fmt.Errorf("%w: %d", ErrUnsupportedSOCKSCommand, req.cmd)
+	}
+	return req.addr, req.port, nil
+}
+
+// readSocks5Request reads one request: CONNECT or UDP ASSOCIATE.
+func (c *Client) readSocks5Request(conn net.Conn) (socksRequest, error) {
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return socksRequest{}, fmt.Errorf("read socks5 request: %w", err)
+	}
+	if header[1] != socksCmdConnect && header[1] != socksCmdUDPAssociate {
+		return socksRequest{}, fmt.Errorf("%w: %d", ErrUnsupportedSOCKSCommand, header[1])
+	}
+	addr, err := c.readSocks5Addr(conn, header[3])
+	if err != nil {
+		return socksRequest{}, err
+	}
 	portBytes := make([]byte, 2)
 	if _, err := io.ReadFull(conn, portBytes); err != nil {
-		return "", 0, fmt.Errorf("read socks5 port: %w", err)
+		return socksRequest{}, fmt.Errorf("read socks5 port: %w", err)
 	}
-	return addr, int(binary.BigEndian.Uint16(portBytes)), nil
+	return socksRequest{cmd: header[1], addr: addr, port: int(binary.BigEndian.Uint16(portBytes))}, nil
 }
 
 func (c *Client) readSocks5Addr(conn net.Conn, addrType byte) (string, error) {

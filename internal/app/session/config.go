@@ -54,6 +54,7 @@ var (
 		"transport required (set transport to datachannel, videochannel, seichannel or vp8channel)")
 	ErrKeyRequired         = errors.New("key required (set crypto.key)")
 	ErrKeysServerOnly      = errors.New("crypto.keys is a server setting (set crypto.key for cnc)")
+	ErrUDPMaxFlowsInvalid  = errors.New("invalid udp max flows (set udp.max_flows to 0 or a positive number)")
 	ErrDNSServerRequired   = errors.New("dns server required (set net.dns)")
 	ErrVideoWidthRequired  = errors.New("video width required for videochannel (set video.width)")
 	ErrVideoHeightRequired = errors.New("video height required for videochannel (set video.height)")
@@ -161,6 +162,10 @@ type Config struct {
 	Amount                int
 	// StatsListen is the server's loopback /stats address; empty disables it.
 	StatsListen string
+	// UDPDisabled turns the SOCKS5 UDP relay off; UDPMaxFlows caps its flows
+	// (0 means the default).
+	UDPDisabled bool
+	UDPMaxFlows int
 }
 
 // RegisterDefaults registers built-in providers and transports.

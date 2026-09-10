@@ -98,6 +98,10 @@ type Config struct {
 	DeviceIDPath     string
 	Claims           map[string]any
 	OnHealth         HealthFunc
+	// UDPDisabled turns the SOCKS5 UDP ASSOCIATE relay off (it is on by
+	// default for library users); UDPMaxFlows caps its flows, 0 = default.
+	UDPDisabled bool
+	UDPMaxFlows int
 }
 
 type runner func(context.Context, internalclient.Config, func(string)) error
@@ -150,7 +154,8 @@ func toClientConfig(cfg Config) internalclient.Config {
 			MinDelay:       cfg.Traffic.MinDelay, MaxDelay: cfg.Traffic.MaxDelay,
 		},
 		DeviceID: cfg.DeviceID, DeviceIDPath: cfg.DeviceIDPath, Claims: cfg.Claims,
-		OnHealth: internalclient.HealthFunc(cfg.OnHealth),
+		OnHealth:    internalclient.HealthFunc(cfg.OnHealth),
+		UDPDisabled: cfg.UDPDisabled, UDPMaxFlows: cfg.UDPMaxFlows,
 	}
 }
 

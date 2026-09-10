@@ -25,6 +25,8 @@ type LinkRoleConfig struct {
 	DeviceID            string
 	OnData              func([]byte)
 	OnPeerData          func(string, []byte)
+	OnDatagram          func([]byte)
+	OnPeerDatagram      func(string, []byte)
 	Resolver            protect.Lookup
 	ProxyAddr           string
 	ProxyPort           int
@@ -45,6 +47,8 @@ func BuildTransportConfig(base LinkConfig, role LinkRoleConfig) transport.Config
 		Name:                names.Generate(),
 		OnData:              role.OnData,
 		OnPeerData:          role.OnPeerData,
+		OnDatagram:          role.OnDatagram,
+		OnPeerDatagram:      role.OnPeerDatagram,
 		DNSServer:           base.DNSServer,
 		Resolver:            Resolver(role.Resolver, base.DNSServer),
 		ProxyAddr:           role.ProxyAddr,

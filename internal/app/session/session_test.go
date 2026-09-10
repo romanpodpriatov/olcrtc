@@ -258,6 +258,15 @@ func TestValidate(t *testing.T) {
 			want: ErrRoomIDRequired,
 		},
 		{
+			name: "negative udp max flows",
+			cfg: func() Config {
+				cfg := base
+				cfg.UDPMaxFlows = -1
+				return cfg
+			}(),
+			want: ErrUDPMaxFlowsInvalid,
+		},
+		{
 			name: "srv accepts a key ring without a single key",
 			cfg: func() Config {
 				cfg := base

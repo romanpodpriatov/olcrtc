@@ -43,12 +43,20 @@ func Validate(cfg Config) error {
 		validateLivenessConfig,
 		validateLifecycleConfig,
 		validateTrafficConfig,
+		validateUDPConfig,
 		validateModeConfig,
 	}
 	for _, check := range checks {
 		if err := check(cfg); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func validateUDPConfig(cfg Config) error {
+	if cfg.UDPMaxFlows < 0 {
+		return ErrUDPMaxFlowsInvalid
 	}
 	return nil
 }

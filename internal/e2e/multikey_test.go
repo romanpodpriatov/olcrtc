@@ -25,46 +25,65 @@ type ringTunnel struct {
 	ready     bool
 }
 
-// startRingTunnel runs a server holding the ring and a client holding
-// clientKey. With withStats the server also serves /stats on a loopback port.
-func startRingTunnel(
-	t *testing.T, ring []string, clientKey string, withStats bool, readyBudget time.Duration,
-) ringTunnel {
+// ringTunnelSpec describes a ring tunnel to bring up: the server's ring and
+// the client's key, the transport (datachannel when empty), whether the
+// server serves /stats, whether its UDP relay may reach private targets, and
+// how long the client gets to become ready.
+type ringTunnelSpec struct {
+	ring            []string
+	clientKey       string
+	transport       string
+	withStats       bool
+	allowPrivateUDP bool
+	readyBudget     time.Duration
+}
+
+// startRingTunnel runs a server holding the ring and a client holding the
+// client key over the memory provider.
+func startRingTunnel(t *testing.T, spec ringTunnelSpec) ringTunnel {
 	t.Helper()
+	transportName := spec.transport
+	if transportName == "" {
+		transportName = transportData
+	}
 	providerName, room := registerMemoryProvider(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	socksAddr := freeLocalAddr(ctx, t)
 	statsAddr := ""
-	if withStats {
+	if spec.withStats {
 		statsAddr = freeLocalAddr(ctx, t)
 	}
 	go func() {
 		_ = server.Run(ctx, server.Config{
-			Transport: transportData, Provider: providerName, RoomURL: testRoom,
-			Keys: ring, StatsListen: statsAddr, DNSServer: localDNSServer,
+			Transport: transportName, TransportOptions: e2eTransportOptions(transportName),
+			Provider: providerName, RoomURL: testRoom, Keys: spec.ring, StatsListen: statsAddr,
+			UnsafeAllowPrivateUDPTargets: spec.allowPrivateUDP, DNSServer: localDNSServer,
 		})
 	}()
 	room.waitConnected(t, 1)
 	ready := make(chan struct{})
 	go func() {
 		_ = client.RunWithReady(ctx, client.Config{
-			Transport: transportData, Provider: providerName, RoomURL: testRoom,
-			KeyHex: clientKey, DeviceID: testClientDeviceID, LocalAddr: socksAddr, DNSServer: localDNSServer,
+			Transport: transportName, TransportOptions: e2eTransportOptions(transportName),
+			Provider: providerName, RoomURL: testRoom, KeyHex: spec.clientKey,
+			DeviceID: testClientDeviceID, LocalAddr: socksAddr, DNSServer: localDNSServer,
 		}, func() { close(ready) })
 	}()
 	tunnel := ringTunnel{socksAddr: socksAddr, statsAddr: statsAddr}
 	select {
 	case <-ready:
 		tunnel.ready = true
-	case <-time.After(readyBudget):
+	case <-time.After(spec.readyBudget):
 	}
 	return tunnel
 }
 
 func TestMultiKeySecondRingKeyPairsAndRelays(t *testing.T) {
 	echoAddr := startEchoServer(t)
-	tunnel := startRingTunnel(t, []string{testKeyHex, altKeyHex}, altKeyHex, false, 20*time.Second)
+	tunnel := startRingTunnel(t, ringTunnelSpec{
+		ring: []string{testKeyHex, altKeyHex}, clientKey: altKeyHex, readyBudget: 20 * time.Second,
+	})
 	if !tunnel.ready {
 		t.Fatal("client holding the second ring key never became ready")
 	}
@@ -91,7 +110,9 @@ func echoOnce(t *testing.T, socksAddr, echoAddr, tag string) int {
 
 func TestMultiKeyUnknownKeyNeverPairs(t *testing.T) {
 	echoAddr := startEchoServer(t)
-	tunnel := startRingTunnel(t, []string{testKeyHex, altKeyHex}, badKeyHex, false, 3*time.Second)
+	tunnel := startRingTunnel(t, ringTunnelSpec{
+		ring: []string{testKeyHex, altKeyHex}, clientKey: badKeyHex, readyBudget: 3 * time.Second,
+	})
 	if tunnel.ready {
 		// The SOCKS listener opens only after the handshake; a client outside
 		// the ring must never get there.

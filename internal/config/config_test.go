@@ -106,6 +106,7 @@ func requireAppliedConfig(t *testing.T, got session.Config) {
 		TrafficMinDelay:       "5ms",
 		TrafficMaxDelay:       "30ms",
 		Amount:                3,
+		UDPDisabled:           true,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Apply produced wrong config: %+v, want %+v", got, want)
@@ -169,6 +170,7 @@ func TestApplyMapsEverySection(t *testing.T) {
 		Video:              session.VideoConfig{Width: 640, Height: 480, QRSize: 128, Codec: "tile", TileModule: 4, TileRS: 2},
 		SEI:                session.SEIConfig{FPS: 15, BatchSize: 8, FragmentSize: 700, AckTimeoutMS: 1500},
 		MaxSessionDuration: "1h",
+		UDPDisabled:        true,
 	}
 
 	if !reflect.DeepEqual(got, want) {
@@ -209,8 +211,49 @@ video:
 		file.Video.Bitrate != "5000k" || file.Video.HW != "nvenc" {
 		t.Fatalf("legacy fields = %#v", file)
 	}
-	if got := Apply(file); !reflect.DeepEqual(got, session.Config{Mode: "cnc"}) {
+	if got := Apply(file); !reflect.DeepEqual(got, session.Config{Mode: "cnc", UDPDisabled: true}) {
 		t.Fatalf("Apply() mapped ignored legacy fields: %#v", got)
+	}
+}
+
+func TestUDPRelayIsOptIn(t *testing.T) {
+	if got := Apply(File{}); !got.UDPDisabled {
+		t.Fatal("no udp block: UDPDisabled = false, want true")
+	}
+	enabled := true
+	if got := Apply(File{Settings: Settings{UDP: UDP{Enabled: &enabled}}}); got.UDPDisabled {
+		t.Fatal("udp.enabled=true: UDPDisabled = true, want false")
+	}
+	disabled := true
+	got := Apply(File{Settings: Settings{UDP: UDP{Enabled: &enabled, Disabled: &disabled}}})
+	if !got.UDPDisabled {
+		t.Fatal("udp.enabled+disabled: UDPDisabled = false, want disabled to win")
+	}
+	maxFlows := 7
+	if got := Apply(File{Settings: Settings{UDP: UDP{MaxFlows: &maxFlows}}}); got.UDPMaxFlows != 7 {
+		t.Fatalf("UDPMaxFlows = %d, want 7", got.UDPMaxFlows)
+	}
+}
+
+func TestApplyProfileOverridesOnlyTheUDPKeysItNames(t *testing.T) {
+	base := Apply(File{})
+	enabled := true
+	if got := ApplyProfile(base, Profile{Settings: Settings{UDP: UDP{Enabled: &enabled}}}); got.UDPDisabled {
+		t.Fatal("profile udp.enabled=true over the gated base: UDPDisabled = true, want false")
+	}
+	on := session.Config{UDPDisabled: false, UDPMaxFlows: 10}
+	if got := ApplyProfile(on, Profile{}); got.UDPDisabled || got.UDPMaxFlows != 10 {
+		t.Fatalf("profile without a udp block changed it: %+v", got)
+	}
+	zero := 0
+	notDisabled := false
+	got := ApplyProfile(session.Config{UDPDisabled: true, UDPMaxFlows: 10},
+		Profile{Settings: Settings{UDP: UDP{Disabled: &notDisabled, MaxFlows: &zero}}})
+	if !got.UDPDisabled {
+		t.Fatal("a bare disabled: false turned the relay on; only enabled: true may")
+	}
+	if got.UDPMaxFlows != 0 {
+		t.Fatalf("UDPMaxFlows = %d, want the profile's explicit 0", got.UDPMaxFlows)
 	}
 }
 

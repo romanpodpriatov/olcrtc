@@ -83,6 +83,7 @@ func runServer(
 	err := server.Run(ctx, server.Config{
 		Transport: cfg.Transport, Provider: cfg.Provider, RoomURL: roomURL, ChannelID: cfg.ChannelID,
 		KeyHex: cfg.KeyHex, Keys: cfg.KeysHex, StatsListen: cfg.StatsListen,
+		UDPDisabled: cfg.UDPDisabled, UDPMaxFlows: cfg.UDPMaxFlows,
 		DNSServer: cfg.DNSServer, Resolver: cfg.Resolver,
 		SOCKSProxyAddr: cfg.SOCKSProxyAddr, SOCKSProxyPort: cfg.SOCKSProxyPort,
 		SOCKSProxyUser: cfg.SOCKSProxyUser, SOCKSProxyPass: cfg.SOCKSProxyPass,
@@ -119,6 +120,7 @@ func runClient(
 		SOCKSPass: cfg.SOCKSPass, TransportOptions: opts, Engine: cfg.Engine,
 		URL: cfg.URL, Token: cfg.Token, ProviderToken: cfg.ProviderToken,
 		Liveness: liveness, Traffic: traffic,
+		UDPDisabled: cfg.UDPDisabled, UDPMaxFlows: cfg.UDPMaxFlows,
 	})
 	if err != nil {
 		return fmt.Errorf("client: %w", err)

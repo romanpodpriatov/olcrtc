@@ -78,7 +78,9 @@ func (s *Server) dial(ctx context.Context, request ConnectRequest) (net.Conn, er
 		return conn, nil
 	}
 	proxyAddr := net.JoinHostPort(s.socksProxyAddr, strconv.Itoa(s.socksProxyPort))
-	conn, err := dialer.DialContext(ctx, "tcp4", proxyAddr)
+	// "tcp", not "tcp4": the proxy is operator configuration and may be an
+	// IPv6 literal; the target dial keeps upstream's tcp4.
+	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial proxy: %w", err)
 	}

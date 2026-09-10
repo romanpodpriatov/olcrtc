@@ -71,6 +71,8 @@ type runtimeConfig struct {
 	vp8           client.VP8Options
 	sei           client.SEIOptions
 	video         client.VideoOptions
+	// udpDisabled turns the SOCKS5 UDP relay off; SetUDP steers it.
+	udpDisabled bool
 }
 
 func defaultRuntimeConfig() runtimeConfig {
@@ -334,6 +336,14 @@ func (r *Runtime) SetDebug(enabled bool) {
 	logger.SetVerbose(enabled)
 }
 
+// SetUDP turns the SOCKS5 UDP ASSOCIATE relay on or off for the next Start.
+// It is on by default.
+func (r *Runtime) SetUDP(enabled bool) {
+	r.mu.Lock()
+	r.defaults.udpDisabled = !enabled
+	r.mu.Unlock()
+}
+
 func (cfg runtimeConfig) clientConfig() client.Config {
 	return client.Config{
 		Transport: cfg.transport, Provider: cfg.provider, RoomURL: cfg.roomURL,
@@ -344,6 +354,7 @@ func (cfg runtimeConfig) clientConfig() client.Config {
 		DNSServer: cfg.dnsServer, Resolver: cfg.lookup(),
 		TransportOptions: cfg.transportOptions(), Liveness: cfg.liveness, Traffic: cfg.traffic,
 		DeviceID: cfg.deviceID, DeviceIDPath: cfg.deviceIDPath,
+		UDPDisabled: cfg.udpDisabled,
 	}
 }
 

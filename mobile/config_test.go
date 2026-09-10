@@ -177,3 +177,36 @@ func TestSetDNSTakesAListAndAppliesItToTheRuntimeResolver(t *testing.T) {
 		t.Fatalf("Servers() = %v, want the list in order with the default port filled in", got)
 	}
 }
+
+func TestSetUDPReachesTheClientConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		set          func(*Runtime)
+		wantDisabled bool
+	}{
+		{name: "on by default", set: func(*Runtime) {}, wantDisabled: false},
+		{name: "SetUDP(false) turns it off", set: func(r *Runtime) { r.SetUDP(false) }, wantDisabled: true},
+		{name: "SetUDP(true) turns it back on", set: func(r *Runtime) { r.SetUDP(false); r.SetUDP(true) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configs := make(chan client.Config, 1)
+			runtime := configuredRuntime(t, func(ctx context.Context, cfg client.Config, onReady func(string)) error {
+				configs <- cfg
+				onReady(cfg.LocalAddr)
+				<-ctx.Done()
+				return ctx.Err()
+			})
+			tc.set(runtime)
+			if err := runtime.Start(); err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			if err := runtime.WaitReady(100); err != nil {
+				t.Fatalf("WaitReady() error = %v", err)
+			}
+			if cfg := <-configs; cfg.UDPDisabled != tc.wantDisabled {
+				t.Fatalf("UDPDisabled = %v, want %v", cfg.UDPDisabled, tc.wantDisabled)
+			}
+			_ = runtime.Stop(100)
+		})
+	}
+}

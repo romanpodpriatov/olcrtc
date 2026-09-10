@@ -82,6 +82,13 @@ type Client struct {
 	livenessFallback time.Duration
 	shutdownGrace    time.Duration
 	fallbackPending  atomic.Bool
+
+	// UDP relay state: one entry per (association, SOCKS source, target).
+	udpMu        sync.Mutex
+	udpFlows     map[uint64]clientUDPFlow
+	udpFlowIndex map[clientUDPFlowKey]uint64
+	udpDisabled  bool
+	maxUDPFlows  int
 }
 
 // HealthFunc is called when the client control health snapshot changes.
@@ -110,6 +117,10 @@ type Config struct {
 	DeviceIDPath     string
 	Claims           map[string]any
 	OnHealth         HealthFunc
+	// UDPDisabled turns the SOCKS5 UDP ASSOCIATE relay off; UDPMaxFlows caps
+	// concurrent flows (0 means the default).
+	UDPDisabled bool
+	UDPMaxFlows int
 }
 
 // Run starts the client with the given configuration.
@@ -141,6 +152,8 @@ func RunWithAddress(ctx context.Context, cfg Config, onReady func(actualAddr str
 		keys: keys, deviceID: deviceID, claims: cfg.Claims, dnsServer: cfg.DNSServer,
 		socksUser: cfg.SOCKSUser, socksPass: cfg.SOCKSPass,
 		health: runtime.NewHealthTracker(cfg.OnHealth), sessionReady: make(chan struct{}),
+		udpFlows: make(map[uint64]clientUDPFlow), udpFlowIndex: make(map[clientUDPFlowKey]uint64),
+		udpDisabled: cfg.UDPDisabled, maxUDPFlows: normalizeMaxUDPFlows(cfg.UDPMaxFlows),
 	}
 	defer func() {
 		cancel()

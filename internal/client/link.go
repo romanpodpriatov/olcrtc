@@ -31,7 +31,7 @@ func (c *Client) bringUpLink(ctx context.Context, cfg Config, cancel context.Can
 		ChannelID: cfg.ChannelID, DNSServer: cfg.DNSServer,
 		Options: cfg.TransportOptions, Traffic: cfg.Traffic,
 	}, tunnelcore.LinkRoleConfig{
-		DeviceID: c.deviceID, OnData: c.onData, Resolver: cfg.Resolver,
+		DeviceID: c.deviceID, OnData: c.onData, OnDatagram: c.onDatagram, Resolver: cfg.Resolver,
 		RequireTargetedPeer: true,
 	})
 	link, err := transport.New(ctx, cfg.Transport, linkCfg)

@@ -74,6 +74,9 @@ olcrtc /etc/olcrtc/client.yaml
 | `lifecycle.max_session_duration` | плановый rebuild сессии, например `6h`; пусто = выключено |
 | `traffic.max_payload_size` | лимит зашифрованного wire-message; `0` = лимит транспорта |
 | `traffic.min_delay` / `traffic.max_delay` | необязательный pacing отправки, например `5ms` / `30ms` |
+| `udp.enabled` | включает lossy-релей SOCKS5 UDP ASSOCIATE (звонки, игры); выключен, пока не `true` |
+| `udp.disabled` | `true` перевешивает `enabled` |
+| `udp.max_flows` | одновременных UDP-потоков на сторону, по умолчанию 1024 |
 | `gen.amount` | режим `gen`: сколько комнат создать |
 | `profiles[]` | список failover-профилей для `srv`/`cnc` |
 | `failover.retry_delay` | пауза перед следующим профилем, например `2s` |
