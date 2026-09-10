@@ -47,6 +47,7 @@ type peerSession struct {
 
 	controlMu sync.Mutex
 	control   *kcpRuntime
+	closed    bool // ai-generated: guarded by controlMu; fences late control creation.
 
 	// lastSeen is a UnixNano timestamp refreshed by every inbound frame.
 	lastSeen int64
@@ -72,15 +73,16 @@ func (s *peerSession) touch(now time.Time) {
 
 // close releases both KCP sessions and stops the writer pump. Safe to call
 // more than once.
+// ai-generated: fence control creation before detaching and closing both runtimes.
 func (s *peerSession) close() {
 	s.closeOnce.Do(func() {
-		s.data.close()
-
 		s.controlMu.Lock()
+		s.closed = true
 		control := s.control
 		s.control = nil
 		s.controlMu.Unlock()
 
+		s.data.close()
 		if control != nil {
 			control.close()
 		}
@@ -308,6 +310,11 @@ func (p *streamTransport) peerControlFor(epoch uint32) *kcpRuntime {
 
 	sess.controlMu.Lock()
 	defer sess.controlMu.Unlock()
+
+	// ai-generated: an in-flight lookup can outlive removal from the peer table.
+	if sess.closed {
+		return nil
+	}
 
 	if sess.control != nil {
 		return sess.control
