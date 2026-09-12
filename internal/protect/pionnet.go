@@ -34,8 +34,16 @@ var ErrUnexpectedConnType = errors.New("protect: unexpected connection type")
 // tunInterfacePrefixes lists interface name prefixes excluded from candidate
 // gathering. Keep pptp explicit; it does not match the ppp prefix.
 //
+// "utun" is Apple's, and its absence was a real bug: an iPhone's own packet
+// tunnel is utun6, which "tun" does not match, so the engine gathered a
+// candidate on the tunnel it was itself carrying and then tried to reach every
+// STUN and TURN server from 172.19.0.1 — the tun's own address. Each attempt
+// failed with "can't assign requested address", dozens per connection, and the
+// time they wasted came out of the eight seconds a start is given. Android was
+// never affected: its tun is tun0.
+//
 //nolint:gochecknoglobals // fixed lookup table; a slice cannot be const
-var tunInterfacePrefixes = []string{"tun", "ppp", "pptp"}
+var tunInterfacePrefixes = []string{"tun", "utun", "ppp", "pptp"}
 
 const (
 	ipNetwork4           = "ip4"

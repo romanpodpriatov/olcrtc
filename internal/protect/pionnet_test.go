@@ -454,3 +454,23 @@ func TestProtectedNetDialResolvesThroughTheConfiguredServer(t *testing.T) {
 		t.Fatal("the configured server was never asked")
 	}
 }
+
+// An iPhone's own packet tunnel is utun6, and "tun" does not match it: the
+// engine gathered a candidate on the tunnel it was carrying and sent STUN and
+// TURN from the tun's own address, which the kernel refuses.
+func TestInterfaceByNameRejectsAppleTun(t *testing.T) {
+	n, err := NewProtectedNet()
+	if err != nil {
+		t.Fatalf("NewProtectedNet() error = %v", err)
+	}
+	for _, name := range []string{"utun0", "utun6", "utun12"} {
+		if _, err := n.InterfaceByName(name); !errors.Is(err, transport.ErrInterfaceNotFound) {
+			t.Errorf("InterfaceByName(%s) error = %v, want %v", name, err, transport.ErrInterfaceNotFound)
+		}
+	}
+	// A real interface whose name merely starts with a letter before "tun"
+	// must still be usable; the prefix list is not a substring search.
+	if isTunInterface("en0") || isTunInterface("pdp_ip0") {
+		t.Error("a cellular or Wi-Fi interface was treated as a tunnel")
+	}
+}
