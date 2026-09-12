@@ -12,6 +12,7 @@ import (
 	internalclient "github.com/openlibrecommunity/olcrtc/internal/client"
 	"github.com/openlibrecommunity/olcrtc/internal/control"
 	"github.com/openlibrecommunity/olcrtc/internal/protect"
+	runtimecfg "github.com/openlibrecommunity/olcrtc/internal/runtime"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/seichannel"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/videochannel"
@@ -177,4 +178,13 @@ func toTransportOptions(options TransportOptions) transport.Options {
 // manipulation or extension. It is safe to call multiple times.
 func RegisterDefaults() {
 	session.RegisterDefaults()
+}
+
+// UseConstrainedBuffers shrinks every receive window this process advertises,
+// for a host that is killed rather than swapped when it grows — an iOS packet
+// tunnel extension is given roughly 50 MB, and the server-sized windows do not
+// fit in it. Call it before starting a session; the peer needs no matching
+// change, since both smux and KCP announce their receive windows.
+func UseConstrainedBuffers() {
+	runtimecfg.UseConstrainedBuffers()
 }

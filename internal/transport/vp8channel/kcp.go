@@ -8,7 +8,18 @@ import (
 	"sync"
 
 	kcp "github.com/xtaci/kcp-go/v5"
+
+	runtimecfg "github.com/openlibrecommunity/olcrtc/internal/runtime"
 )
+
+// kcpWindow returns the send and receive window in segments for this host's
+// memory profile.
+func kcpWindow() (int, int) {
+	if runtimecfg.BuffersAreConstrained() {
+		return kcpConstrainedSndWnd, kcpConstrainedRcvWnd
+	}
+	return kcpSndWnd, kcpRcvWnd
+}
 
 // Both peers establish a KCP session with the same convid. KCP does not
 // require a handshake - packets are matched by conv field, so a static
@@ -32,6 +43,15 @@ const (
 	// instead of being clamped to a fraction of it.
 	kcpSndWnd = 4096
 	kcpRcvWnd = 4096
+
+	// The same windows on a host that is killed for using memory rather than
+	// swapped: 4096 segments is about 5.7 MB per direction, and this
+	// transport runs two KCP sessions (data and control), which on its own
+	// is more than an iOS packet tunnel extension is allowed in total. 1024
+	// segments is ~1.4 MB, still several times the bandwidth-delay product of
+	// the relays this transport rides. See runtime.UseConstrainedBuffers.
+	kcpConstrainedSndWnd = 1024
+	kcpConstrainedRcvWnd = 1024
 
 	// Length prefix for our message framing on top of KCP stream mode.
 	// We use stream mode because UDPSession.Write fragments messages > MSS
@@ -79,7 +99,7 @@ func startKCP(out chan<- *packetBuffer, onData func([]byte), epochHdr [epochHdrL
 	// the wire. With nc=1 KCP keeps the window full and retransmits the few
 	// losses, letting throughput reach the SFU's real ceiling.
 	sess.SetNoDelay(1, 5, 2, 1)
-	sess.SetWindowSize(kcpSndWnd, kcpRcvWnd)
+	sess.SetWindowSize(kcpWindow())
 	sess.SetMtu(kcpMTU)
 	// Upstream marked SetStreamMode deprecated without providing a replacement;
 	// stream framing is still required for our wire format.

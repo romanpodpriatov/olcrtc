@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	runtimecfg "github.com/openlibrecommunity/olcrtc/internal/runtime"
 )
 
 func TestKCPConnReadWriteDeadlinesAndClose(t *testing.T) {
@@ -162,4 +164,25 @@ func TestPacketBufferPoolClassesAndDropsOversized(t *testing.T) {
 		t.Fatal("oversized packet retained a pool owner")
 	}
 	oversized.release()
+}
+
+// Two KCP sessions run per transport, so 4096 segments each way is more than
+// an iOS packet tunnel extension is allowed in total.
+func TestKcpWindowShrinksForAConstrainedHost(t *testing.T) {
+	t.Cleanup(func() { runtimecfg.ResetBufferProfileForTest() })
+
+	snd, rcv := kcpWindow()
+	if snd != kcpSndWnd || rcv != kcpRcvWnd {
+		t.Fatalf("server window = %d/%d, want %d/%d", snd, rcv, kcpSndWnd, kcpRcvWnd)
+	}
+
+	runtimecfg.UseConstrainedBuffers()
+	snd, rcv = kcpWindow()
+	if snd != kcpConstrainedSndWnd || rcv != kcpConstrainedRcvWnd {
+		t.Fatalf("constrained window = %d/%d, want %d/%d", snd, rcv, kcpConstrainedSndWnd, kcpConstrainedRcvWnd)
+	}
+	const segment = kcpMTU
+	if got := rcv * segment; got > 2*1024*1024 {
+		t.Fatalf("constrained receive window is %d bytes per direction, too much for a 50 MB process", got)
+	}
 }

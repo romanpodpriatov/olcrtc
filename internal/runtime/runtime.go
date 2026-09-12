@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtaci/smux"
@@ -33,7 +34,48 @@ const (
 	smuxMaxFrameSize     = 32 * 1024
 	smuxMaxReceiveBuffer = 32 * 1024 * 1024
 	smuxMaxStreamBuffer  = 4 * 1024 * 1024
+
+	// A mobile VPN extension is a much smaller box than a server. Apple gives
+	// a packet tunnel provider roughly 50 MB and terminates it for exceeding
+	// that, and the same process also carries sing-box and Xray. The windows
+	// above do not fit: 32 MB of session buffer plus 4 MB per stream is the
+	// budget on its own, and a speed test with a dozen parallel streams fills
+	// it. A window only has to cover the bandwidth-delay product, which on a
+	// 5 Mbit/s relay at 300 ms is about 200 KB, so these are still several
+	// times larger than the link can keep in flight.
+	smuxConstrainedReceiveBuffer = 4 * 1024 * 1024
+	smuxConstrainedStreamBuffer  = 512 * 1024
 )
+
+// constrainedBuffers is set once, before any session starts, by a host that
+// has a hard memory ceiling.
+var constrainedBuffers atomic.Bool //nolint:gochecknoglobals // process-wide memory profile
+
+// UseConstrainedBuffers shrinks every receive window this process advertises,
+// for hosts that are killed rather than swapped when they grow: the iOS
+// packet tunnel extension, and the Android VPN service beside it.
+//
+// Receive windows are local. smux announces its per-stream window to the peer
+// with a window update, and KCP carries its receive window in every segment
+// header, so a client can shrink unilaterally and an unchanged server simply
+// sends less at a time.
+func UseConstrainedBuffers() { constrainedBuffers.Store(true) }
+
+// BuffersAreConstrained reports the profile chosen for this process.
+func BuffersAreConstrained() bool { return constrainedBuffers.Load() }
+
+// ResetBufferProfileForTest restores the server profile. Tests only: the
+// switch is one-way in a running process, which is what a host that never
+// changes shape mid-flight wants. Exported because the transports that read
+// the profile test it from their own packages.
+func ResetBufferProfileForTest() { constrainedBuffers.Store(false) }
+
+func receiveBufferSizes() (int, int) {
+	if constrainedBuffers.Load() {
+		return smuxConstrainedReceiveBuffer, smuxConstrainedStreamBuffer
+	}
+	return smuxMaxReceiveBuffer, smuxMaxStreamBuffer
+}
 
 // ErrKeyRequired is returned when no encryption key is provided.
 var ErrKeyRequired = errors.New("key required (use -key <hex>)")
@@ -70,8 +112,7 @@ func SmuxConfig(maxWirePayload int) *smux.Config {
 	cfg.KeepAliveDisabled = false
 	cfg.MaxFrameSize = smuxMaxFrameSize
 	clampMaxFrameSize(cfg, maxWirePayload)
-	cfg.MaxReceiveBuffer = smuxMaxReceiveBuffer
-	cfg.MaxStreamBuffer = smuxMaxStreamBuffer
+	cfg.MaxReceiveBuffer, cfg.MaxStreamBuffer = receiveBufferSizes()
 	cfg.KeepAliveInterval = 10 * time.Second
 	cfg.KeepAliveTimeout = 30 * time.Second
 	return cfg

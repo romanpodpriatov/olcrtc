@@ -72,6 +72,11 @@ func New() *Runtime {
 }
 
 func newRuntime(runner clientRunner) *Runtime {
+	// Every host of this package is a phone: an iOS packet tunnel extension
+	// with a ~50 MB ceiling, or the Android VPN service. Server-sized receive
+	// windows get the extension killed mid-transfer, which the app can only
+	// report as "the packet tunnel is down".
+	client.UseConstrainedBuffers()
 	client.RegisterDefaults()
 	return &Runtime{
 		defaults: defaultRuntimeConfig(),
