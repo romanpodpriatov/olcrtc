@@ -163,6 +163,10 @@ type Conn struct {
 	leftoverBuf *[]byte
 	leftover    []byte
 
+	// inBytes counts plaintext opened from the peer; the control-stream
+	// liveness check reads it through InboundBytes.
+	inBytes atomic.Uint64
+
 	// decrypt failure accounting for the rate-limited log in Push, and by
 	// kind for the client's handshake classifier (see DecryptStats).
 	decryptFails  atomic.Uint64
@@ -313,6 +317,7 @@ func (c *Conn) Push(ciphertext []byte) {
 		return
 	}
 	*bufPtr = pt
+	c.inBytes.Add(uint64(len(pt)))
 	if c.closed.Load() {
 		releaseFrameBuf(bufPtr)
 		return
@@ -353,6 +358,16 @@ func (c *Conn) noteDecryptFailure(size int, err error) {
 	dropped := total - c.decryptLogged.Swap(total)
 	logger.Warnf("muxconn: decrypt failed for %d more frames in the last %s, latest len=%d: %v",
 		dropped, decryptLogInterval, size, err)
+}
+
+// InboundBytes reports the plaintext this conn has opened from the peer since
+// it was created. It only ever grows, and the control-stream liveness check
+// reads it to tell a pong queued behind a bulk transfer from a dead link.
+func (c *Conn) InboundBytes() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.inBytes.Load()
 }
 
 // DecryptStats counts inbound records this conn could not open, by kind: a

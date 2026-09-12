@@ -42,6 +42,12 @@ const (
 	// DefaultFailures is the default number of consecutive missed pongs before
 	// the stream is marked unhealthy.
 	DefaultFailures = 4
+	// maxStalledProbes bounds how many probes in a row payload progress may
+	// excuse. At the default interval that is three minutes of the peer
+	// sending data without ever answering a ping: far longer than any
+	// transfer-induced stall, and still short enough to catch a control
+	// stream that has genuinely wedged while its transport keeps working.
+	maxStalledProbes = 18
 )
 
 // MsgType labels a control message.
@@ -108,6 +114,18 @@ type Config struct {
 	OnMissedPong func(missed int)
 	// OnUnhealthy is called before Run returns [ErrUnhealthy].
 	OnUnhealthy func(missed int)
+	// Progress reports a monotonic count of payload received from the peer.
+	//
+	// On a transport with no control plane of its own the ping shares one
+	// smux session, and one SCTP association, with every bulk stream: a
+	// speedtest queues megabytes ahead of it and the pong comes back tens of
+	// seconds late. A peer whose payload is still arriving is not a dead
+	// link, so while this counter moves a timed-out probe is not counted as
+	// a missed pong — up to [maxStalledProbes] in a row. Nil disables the
+	// check and every timeout counts, as it did before.
+	Progress func() uint64
+	// OnStalled is called when payload progress excuses timed-out probes.
+	OnStalled func(timedOut int)
 }
 
 func (cfg Config) withDefaults() Config {
@@ -162,10 +180,13 @@ type state struct {
 
 	out chan Message
 
-	mu       sync.Mutex
-	pending  map[uint64]time.Time
-	nextSeq  uint64
-	failures int
+	mu           sync.Mutex
+	pending      map[uint64]time.Time
+	nextSeq      uint64
+	failures     int
+	stalled      int
+	lastProgress uint64
+	progressSeen bool
 }
 
 func (s *state) readLoop(ctx context.Context) error {
@@ -236,17 +257,25 @@ func (s *state) probeLoop(ctx context.Context) error {
 
 func (s *state) sendProbe(ctx context.Context) error {
 	now := s.now()
+	// Read outside the lock: it is caller-supplied code.
+	moved := s.peerSending()
 
 	s.mu.Lock()
-	missedNow := 0
+	timedOut := 0
 	for seq, sent := range s.pending {
 		if now.Sub(sent) < s.cfg.Timeout {
 			continue
 		}
 		delete(s.pending, seq)
-		s.failures++
-		missedNow++
+		timedOut++
 	}
+	stalledNow := 0
+	if timedOut > 0 && moved && s.stalled < maxStalledProbes {
+		s.stalled += timedOut
+		stalledNow, timedOut = timedOut, 0
+	}
+	missedNow := timedOut
+	s.failures += timedOut
 	missed := s.failures
 	if s.failures >= s.cfg.Failures {
 		s.mu.Unlock()
@@ -266,6 +295,9 @@ func (s *state) sendProbe(ctx context.Context) error {
 	if missedNow > 0 && s.cfg.OnMissedPong != nil {
 		s.cfg.OnMissedPong(missed)
 	}
+	if stalledNow > 0 && s.cfg.OnStalled != nil {
+		s.cfg.OnStalled(stalledNow)
+	}
 
 	return s.enqueue(ctx, Message{
 		Version:      ProtoVersion,
@@ -283,6 +315,7 @@ func (s *state) handlePong(msg Message) {
 	if ok {
 		delete(s.pending, msg.Seq)
 		s.failures = 0
+		s.stalled = 0
 	}
 	s.mu.Unlock()
 
@@ -294,6 +327,21 @@ func (s *state) handlePong(msg Message) {
 		RTT:      now.Sub(sent),
 		LastSeen: now,
 	})
+}
+
+// peerSending reports whether the peer's payload counter has moved since the
+// previous probe. A counter that goes backwards (a session rebuilt under us)
+// counts as movement: what matters is that something arrived.
+func (s *state) peerSending() bool {
+	if s.cfg.Progress == nil {
+		return false
+	}
+	seen := s.cfg.Progress()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	moved := s.progressSeen && seen != s.lastProgress
+	s.lastProgress, s.progressSeen = seen, true
+	return moved
 }
 
 func (s *state) enqueue(ctx context.Context, msg Message) error {

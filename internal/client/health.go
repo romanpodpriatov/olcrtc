@@ -38,6 +38,11 @@ func (c *Client) startControlLoop(
 			c.notifyLinkHealth(false)
 		},
 		OnDeath: func(error) { c.handleReconnect(ctx, cfg, cancel, reconnectLiveness) },
+		Progress: func() uint64 {
+			c.sessMu.RLock()
+			defer c.sessMu.RUnlock()
+			return c.conn.InboundBytes()
+		},
 	}
 	c.goTracked(func() { c.watchControlStaleness(controlCtx, pingInterval) })
 	c.goTracked(func() { runner.Run(controlCtx, stream) })

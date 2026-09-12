@@ -28,6 +28,11 @@ func (s *Server) startControlLoop(ctx context.Context, session *smux.Session, st
 				s.ln.Reconnect("liveness")
 			}
 		},
+		Progress: func() uint64 {
+			s.sessMu.RLock()
+			defer s.sessMu.RUnlock()
+			return s.conn.InboundBytes()
+		},
 	}
 	s.wg.Add(1)
 	go func() {

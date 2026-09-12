@@ -28,6 +28,8 @@ type ControlRunner struct {
 	LogFields func() string
 	OnPong    func(control.Health)
 	OnDeath   func(error)
+	// Progress reports payload received from the peer; see control.Config.
+	Progress func() uint64
 }
 
 // Run blocks until the control stream stops, then invokes OnDeath unless ctx was canceled.
@@ -69,6 +71,10 @@ func (r ControlRunner) tunedConfig() control.Config {
 		if onMissed != nil {
 			onMissed(missed)
 		}
+	}
+	cfg.Progress = r.Progress
+	cfg.OnStalled = func(timedOut int) {
+		logger.Warnf("control pong late %s but the peer is still sending — not counting %d as missed", r.fields(), timedOut)
 	}
 	cfg.OnUnhealthy = func(missed int) {
 		r.Health.RecordUnhealthy(missed)
