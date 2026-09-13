@@ -289,3 +289,71 @@ func TestDialFailuresAreWrapped(t *testing.T) {
 }
 
 var _ syscall.RawConn = rawConnStub{}
+
+// http.NoBody is a non-nil reader meaning "no body", and http.NewRequest gives
+// it no GetBody. A GET built that way looked unreplayable, so one transient
+// failure ended the request — which is how an iPhone changing cellular
+// interface stopped being able to reach a room provider at all.
+func TestRetryReplaysAGetBuiltWithNoBody(t *testing.T) {
+	t.Parallel()
+
+	req, err := http.NewRequestWithContext(
+		context.Background(), http.MethodGet, "https://example.invalid/x", http.NoBody,
+	)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext() error = %v", err)
+	}
+	if req.Body == nil || req.GetBody != nil {
+		t.Skip("net/http no longer builds NoBody requests this way")
+	}
+
+	retry, err := requestForAttempt(req, 1)
+	if err != nil {
+		t.Fatalf("requestForAttempt() error = %v, want a replayable request", err)
+	}
+	if retry.Body != nil && retry.Body != http.NoBody {
+		t.Errorf("retry body = %v, want none", retry.Body)
+	}
+}
+
+// When a body genuinely cannot be replayed, the caller must still learn why the
+// first attempt failed rather than being told about the retry machinery.
+func TestUnreplayableBodyReportsTheTransportError(t *testing.T) {
+	t.Parallel()
+
+	transportErr := &net.DNSError{Err: "server misbehaving", Name: "example.invalid", IsTemporary: true}
+	rt := &retryTransport{base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, transportErr
+	})}
+	req, buildErr := http.NewRequestWithContext(
+		context.Background(), http.MethodPost, "https://example.invalid/x", neverReplayable{},
+	)
+	if buildErr != nil {
+		t.Fatalf("NewRequestWithContext() error = %v", buildErr)
+	}
+	req.GetBody = nil
+
+	resp, err := rt.RoundTrip(req)
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("RoundTrip() error = nil, want the transport's own error")
+	}
+	if !errors.Is(err, transportErr) {
+		t.Errorf("RoundTrip() error = %v, want it to carry %v", err, transportErr)
+	}
+	if errors.Is(err, errRequestBodyNotReplayable) {
+		t.Errorf("RoundTrip() error = %v, want the transport error rather than the retry machinery's", err)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// A body with no GetBody: the case the guard actually exists for.
+type neverReplayable struct{}
+
+func (neverReplayable) Read([]byte) (int, error) { return 0, io.EOF }
+func (neverReplayable) Close() error             { return nil }

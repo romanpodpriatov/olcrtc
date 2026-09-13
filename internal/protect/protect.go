@@ -127,6 +127,13 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 		attempt, requestErr := requestForAttempt(req, i)
 		if requestErr != nil {
+			// A body that cannot be replayed is a reason not to retry, not a
+			// failure of its own: the caller wants to know what the transport
+			// said the first time, which this used to throw away and report as
+			// "prepare retry: request body is not replayable".
+			if err != nil {
+				return resp, fmt.Errorf("round trip: %w", err)
+			}
 			return resp, fmt.Errorf("prepare retry: %w", requestErr)
 		}
 		resp, err = t.base.RoundTrip(attempt)
@@ -162,7 +169,13 @@ func requestForAttempt(req *http.Request, attempt int) (*http.Request, error) {
 		return req, nil
 	}
 	retry := req.Clone(req.Context())
-	if req.Body == nil {
+	// http.NoBody is a non-nil reader for "there is no body", and
+	// http.NewRequest does not give it a GetBody — it is not one of the three
+	// types it recognises. A GET built with it therefore looked unreplayable,
+	// so the first transient failure ended the whole request, and an iPhone
+	// changing cellular interface could not reach the room provider at all.
+	if req.Body == nil || req.Body == http.NoBody {
+		retry.Body = nil
 		return retry, nil
 	}
 	if req.GetBody == nil {
