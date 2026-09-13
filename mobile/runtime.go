@@ -199,7 +199,24 @@ func (r *Runtime) generationError(gen *runGeneration) error {
 	return ErrStoppedBeforeReady
 }
 
-// Stop cancels the current generation and waits for its bounded shutdown.
+// Stop cancels the current generation and waits for its shutdown.
+//
+// It always leaves the runtime startable. The returned error says whether the
+// generation shut down inside the deadline, not whether the runtime can be used
+// again — those were the same thing once, and that is the bug this contract
+// exists to prevent: a teardown that outran its deadline left the state at
+// "stopping", which counts as active, so every later Start was refused with
+// ErrAlreadyRunning. On a phone that is a tunnel which cannot be switched to
+// another room until the app is force-stopped, and it is reached by the
+// ordinary route of a wedged transport, whose writes take 30 s each to fail
+// while Stop is given 5.
+//
+// A generation that misses the deadline is therefore detached rather than
+// waited on. Its goroutines keep unwinding, and when they finish, `finish`
+// finds it is no longer the current generation and leaves the live one alone.
+// The socket a new generation needs is already free: the SOCKS listener is
+// closed by the run function's own defer the moment the context is cancelled,
+// long before the slow half of the teardown.
 func (r *Runtime) Stop(timeoutMillis int) error {
 	r.mu.Lock()
 	if r.state == stateIdle || r.state == stateStopped || r.current == nil {
@@ -220,8 +237,24 @@ func (r *Runtime) Stop(timeoutMillis int) error {
 	case <-gen.done:
 		return nil
 	case <-timer.C:
+		r.abandon(gen)
 		return ErrStopTimeout
 	}
+}
+
+// abandon detaches a generation whose shutdown outran its deadline, so that the
+// runtime can be started again while the old one is still unwinding.
+//
+// Safe against the late finish: `finish` only writes state for the generation
+// that is current, and this one no longer is.
+func (r *Runtime) abandon(gen *runGeneration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.isCurrentGenerationLocked(gen) {
+		return
+	}
+	r.current = nil
+	r.state = stateStopped
 }
 
 // State returns idle, starting, running, stopping, or stopped.

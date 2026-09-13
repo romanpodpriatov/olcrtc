@@ -102,7 +102,15 @@ func TestTimeoutConversionDoesNotOverflow(t *testing.T) {
 	}
 }
 
-func TestStopTimeoutKeepsStoppingState(t *testing.T) {
+// A stop that misses its deadline reports the miss and releases the runtime.
+//
+// This used to assert the opposite — that the state stayed "stopping" until the
+// generation finished on its own. Nothing needed that, and a phone paid for it:
+// "stopping" counts as active, so a teardown that outran its deadline refused
+// every later Start with ErrAlreadyRunning, and the tunnel could not be pointed
+// at another room until the app was force-stopped. What a caller actually needs
+// to know from State() is whether it may start again.
+func TestStopTimeoutReleasesTheRuntime(t *testing.T) {
 	release := make(chan struct{})
 	runtime := configuredRuntime(t, func(context.Context, client.Config, func(string)) error {
 		<-release
@@ -114,8 +122,11 @@ func TestStopTimeoutKeepsStoppingState(t *testing.T) {
 	if err := runtime.Stop(1); !errors.Is(err, ErrStopTimeout) {
 		t.Fatalf("Stop() error = %v, want %v", err, ErrStopTimeout)
 	}
-	if runtime.State() != "stopping" {
-		t.Fatalf("State() = %q, want stopping", runtime.State())
+	if runtime.State() != "stopped" {
+		t.Fatalf("State() = %q, want stopped", runtime.State())
+	}
+	if runtime.IsRunning() {
+		t.Fatal("IsRunning() = true after a stop that gave up waiting")
 	}
 	close(release)
 	waitForState(t, runtime, "stopped")

@@ -47,7 +47,19 @@ const (
 
 const (
 	defaultLivenessFallback = 30 * time.Second
-	defaultShutdownGrace    = 5 * time.Second
+
+	// defaultShutdownGrace bounds how long shutdown waits for tracked
+	// goroutines after they have been told to stop.
+	//
+	// It has to be comfortably smaller than the deadline the host gives the
+	// whole teardown, and it was not: the mobile runtime allows 5 s for all of
+	// shutdown, and this step alone was allowed the same 5 s, so any drain that
+	// did not finish immediately pushed the whole stop past its deadline. On a
+	// phone that showed up as a tunnel that could not be switched to another
+	// room. A goroutine still alive two seconds after being cancelled is stuck
+	// rather than busy, and waiting longer for it only delays the tunnel the
+	// user asked for next.
+	defaultShutdownGrace = 2 * time.Second
 )
 
 // Client handles local SOCKS5 connections and tunnels them to the server.
