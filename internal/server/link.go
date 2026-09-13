@@ -29,9 +29,7 @@ func (s *Server) bringUpLink(ctx context.Context, cfg Config, cancel context.Can
 		return fmt.Errorf("failed to create transport: %w", err)
 	}
 	s.ln = ln
-	if peerLn, ok := ln.(transport.PeerTransport); ok && peerLn.SupportsPeerRouting() {
-		s.peerLn = peerLn
-	}
+	s.peerLn = peerRoutingLink(ln, cfg.Transport)
 	ln.SetEndedCallback(func(reason string) {
 		logger.Infof("Server link reported conference end: %s", reason)
 		cancel()
@@ -77,6 +75,45 @@ func (s *Server) installSession() {
 	}
 }
 
+// peerRoutingLink reports the link as peer-routing only when the server has
+// somewhere to run the handshake, and nil otherwise.
+//
+// Routing peers is two capabilities, and only the first was checked. The
+// server hands the data plane to per-peer callbacks, so `serve` deliberately
+// accepts nothing in this mode; the handshake instead needs a control plane,
+// either per-peer (installPeerControlPlane) or one shared session built on an
+// isolated control channel. A transport with neither leaves
+// installControlSession nothing to build on: it got a nil conn and returned,
+// having installed nothing at all, while serve waited on a context. The link
+// came up, SCTP moved in both directions, and no session was ever opened.
+//
+// That is olcbox#22. jitsi is the only engine that routes peers, and
+// datachannel is the only transport with no control channel of its own, so
+// jitsi+datachannel was the single pairing that reached the gap — while
+// jitsi+vp8channel worked on the same binary, which is what made it look like
+// a room misconfigured by its operator.
+//
+// Declining peer routing puts that pairing on the single-peer path, which is
+// complete and is all a transport without a control channel can honestly
+// offer: one client at a time.
+func peerRoutingLink(ln transport.Transport, name string) transport.PeerTransport {
+	peerLn, ok := ln.(transport.PeerTransport)
+	if !ok || !peerLn.SupportsPeerRouting() {
+		return nil
+	}
+	if _, perPeer := ln.(transport.PeerControlPlane); perPeer {
+		return peerLn
+	}
+	if _, shared := ln.(transport.ControlPlane); shared {
+		return peerLn
+	}
+	logger.Infof(
+		"server: transport %s routes peers but has no control channel of its own; serving one peer at a time",
+		name,
+	)
+	return nil
+}
+
 func (s *Server) installControlSession(ctx context.Context) {
 	if peerControl, ok := s.ln.(transport.PeerControlPlane); ok {
 		s.installPeerControlPlane(peerControl)
@@ -89,6 +126,11 @@ func (s *Server) installControlSession(ctx context.Context) {
 		return
 	}
 	if conn == nil {
+		// Unreachable: peerRoutingLink turns away a link with no control
+		// channel. Said out loud rather than returned in silence, because
+		// silence here is what olcbox#22 looked like from the outside — a
+		// server that connects, logs nothing further, and answers nobody.
+		logger.Warnf("server: peer routing with no control channel to hand the handshake; nothing installed")
 		return
 	}
 	s.sessMu.Lock()
