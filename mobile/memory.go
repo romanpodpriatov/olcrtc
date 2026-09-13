@@ -86,3 +86,25 @@ func MemoryStats() string {
 		runtime.NumGoroutine(),
 	)
 }
+
+// FreeOSMemory returns as much memory to the operating system as the runtime
+// can, immediately.
+//
+// For a host that is killed on its footprint rather than its heap, the
+// difference matters: memory Go has collected but not released is still
+// resident and still counted. The runtime returns it on its own schedule,
+// which is the right trade for a server and the wrong one for a process the
+// system is about to choose as its victim.
+//
+// So this exists for one caller: a memory-pressure notification. iOS sends one
+// before it starts killing, and a packet tunnel provider sits low enough in
+// the jetsam band to be an early choice even when it is nowhere near its own
+// allowance. Answering the warning by handing back everything held in reserve
+// is the cheapest thing that can be done at that moment.
+//
+// It forces a stop-the-world collection, so it belongs on that event and
+// nowhere else. Calling it on a timer would spend the throughput it is meant
+// to protect.
+func FreeOSMemory() {
+	debug.FreeOSMemory()
+}
