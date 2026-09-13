@@ -167,6 +167,12 @@ type Conn struct {
 	// liveness check reads it through InboundBytes.
 	inBytes atomic.Uint64
 
+	// writeStalls counts Writes that waited out the full send deadline
+	// without the transport ever accepting data, and is cleared by the
+	// first Write that gets through. The liveness check reads it through
+	// SendStalled. See that method for why it has to.
+	writeStalls atomic.Uint32
+
 	// decrypt failure accounting for the rate-limited log in Push, and by
 	// kind for the client's handshake classifier (see DecryptStats).
 	decryptFails  atomic.Uint64
@@ -370,6 +376,30 @@ func (c *Conn) InboundBytes() uint64 {
 	return c.inBytes.Load()
 }
 
+// SendStalled reports whether a Write has waited out the whole send deadline
+// with the transport never once accepting data, and nothing has got through
+// since.
+//
+// It exists because nothing else notices. smux is handed a net.Error whose
+// Timeout reports true, which it treats as a deadline rather than a fault, so
+// the session stays open and every later stream fails the same way. And the
+// liveness check cannot see it either: data and control ride separate KCP
+// sessions with separate send windows, so pongs keep arriving on time down a
+// link that has not carried a byte of payload in half a minute. A phone in
+// that state reports a healthy tunnel, loads nothing, and never reconnects,
+// because the only thing that triggers a reconnect is the control stream
+// dying.
+//
+// One stall is the whole answer: the deadline is writeReadyTimeout, and a
+// transport that has refused every byte for that long is dead by the same
+// measure smux's own keepalive uses.
+func (c *Conn) SendStalled() bool {
+	if c == nil {
+		return false
+	}
+	return c.writeStalls.Load() > 0
+}
+
 // DecryptStats counts inbound records this conn could not open, by kind: a
 // bad magic is a peer on a pre-v2 record layer, a failed authentication is a
 // peer on another key. The client's handshake classifier reads them.
@@ -464,8 +494,12 @@ func (c *Conn) recycleIfDrained() {
 // group knows which key the peer holds.
 func (c *Conn) Write(p []byte) (int, error) {
 	if err := c.waitSendReady(); err != nil {
+		if errors.Is(err, ErrWriteTimeout) {
+			c.writeStalls.Add(1)
+		}
 		return 0, err
 	}
+	c.writeStalls.Store(0)
 	// Sealing under a guessed key would hand the peer a frame it silently
 	// drops and desynchronise the smux stream, so wait for the pin. A
 	// pre-pinned group makes this free; an unpinned one is released by the

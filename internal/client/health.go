@@ -43,6 +43,14 @@ func (c *Client) startControlLoop(
 			defer c.sessMu.RUnlock()
 			return c.conn.InboundBytes()
 		},
+		// The data conn, not the control one: the control plane is a separate
+		// KCP session and stays healthy while the data plane is wedged. That
+		// disagreement is the whole point of asking.
+		SendStalled: func() bool {
+			c.sessMu.RLock()
+			defer c.sessMu.RUnlock()
+			return c.conn.SendStalled()
+		},
 	}
 	c.goTracked(func() { c.watchControlStaleness(controlCtx, pingInterval) })
 	c.goTracked(func() { runner.Run(controlCtx, stream) })

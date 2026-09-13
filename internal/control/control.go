@@ -126,6 +126,23 @@ type Config struct {
 	Progress func() uint64
 	// OnStalled is called when payload progress excuses timed-out probes.
 	OnStalled func(timedOut int)
+	// SendStalled reports whether the data plane has given up putting bytes
+	// on the wire.
+	//
+	// Liveness is measured on the control plane, and on a transport that has
+	// one of its own that plane is a different KCP session with its own send
+	// window. So the two directions can disagree completely: pongs arrive on
+	// time while the data plane has not accepted a byte for half a minute,
+	// and every new stream fails with a write timeout that smux treats as a
+	// deadline rather than a fault. The session stays open, the tunnel
+	// reports healthy, nothing is carried, and no reconnect is ever
+	// triggered, because a reconnect only follows the control stream dying.
+	//
+	// Consulted on every probe. Nil disables the check.
+	SendStalled func() bool
+	// OnSendStalled is called before Run returns because the data plane
+	// stopped sending.
+	OnSendStalled func()
 }
 
 func (cfg Config) withDefaults() Config {
@@ -257,8 +274,16 @@ func (s *state) probeLoop(ctx context.Context) error {
 
 func (s *state) sendProbe(ctx context.Context) error {
 	now := s.now()
-	// Read outside the lock: it is caller-supplied code.
+	// Read outside the lock: both are caller-supplied code.
 	moved := s.peerSending()
+	// A link we cannot send on is dead whatever comes back down it. Checked
+	// before the pongs, because the pongs will look fine.
+	if s.cfg.SendStalled != nil && s.cfg.SendStalled() {
+		if s.cfg.OnSendStalled != nil {
+			s.cfg.OnSendStalled()
+		}
+		return fmt.Errorf("%w: the data plane stopped sending", ErrUnhealthy)
+	}
 
 	s.mu.Lock()
 	timedOut := 0
@@ -270,6 +295,9 @@ func (s *state) sendProbe(ctx context.Context) error {
 		timedOut++
 	}
 	stalledNow := 0
+	// `moved` alone is not enough to excuse a timeout: a peer can keep
+	// sending down a link we can no longer answer on, which is the exact
+	// shape SendStalled catches above.
 	if timedOut > 0 && moved && s.stalled < maxStalledProbes {
 		s.stalled += timedOut
 		stalledNow, timedOut = timedOut, 0
