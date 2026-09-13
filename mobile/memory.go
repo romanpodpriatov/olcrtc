@@ -1,8 +1,11 @@
 package mobile
 
 import (
+	"fmt"
 	"math"
+	"runtime"
 	"runtime/debug"
+	"strconv"
 )
 
 // SetMemoryLimit gives the Go runtime a soft memory ceiling, in bytes.
@@ -38,4 +41,48 @@ func MemoryLimit() int64 {
 		return 0
 	}
 	return current
+}
+
+// MemoryStats reports what the Go runtime is holding, as one compact line.
+//
+// The footprint the system kills a process for is not the Go heap: it also
+// counts stacks, the allocator's spans, and everything the process holds that
+// Go never allocated. A trace that carries only the footprint therefore cannot
+// say whether a limit is working, whether a climb is Go's at all, or whether a
+// death happened with the heap nowhere near its ceiling — which is exactly the
+// question left standing after 1.0.411, where the extension died at 39 MB of a
+// 50 MB allowance with 11 MB to spare.
+//
+// So the split is reported rather than inferred:
+//
+//	heap    what is live plus not yet collected, against the limit in force
+//	sys     everything the runtime has taken from the OS, the part of the
+//	        footprint Go is answerable for
+//	rel     of that, what has been handed back and is no longer resident
+//	stacks  goroutine stacks, which a connection-per-stream load grows
+//	gc      collections so far; a number racing upward means the limit binds
+//
+// ReadMemStats stops the world. It is cheap at this rate — tens of
+// microseconds, four times a second — but it is not free, so it belongs in a
+// debugging path and not in the data path.
+func MemoryStats() string {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	mb := func(v uint64) float64 { return float64(v) / (1 << 20) }
+
+	limit := "none"
+	if l := MemoryLimit(); l > 0 {
+		limit = strconv.FormatFloat(float64(l)/(1<<20), 'f', 1, 64)
+	}
+
+	return fmt.Sprintf(
+		"heap %.1f/%s MB  sys %.1f MB  rel %.1f MB  stacks %.1f MB  gc %d  goroutines %d",
+		mb(m.HeapAlloc), limit,
+		mb(m.Sys),
+		mb(m.HeapReleased),
+		mb(m.StackSys),
+		m.NumGC,
+		runtime.NumGoroutine(),
+	)
 }
