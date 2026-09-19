@@ -1,6 +1,8 @@
 package vp8channel
 
 import (
+	"time"
+
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
@@ -14,6 +16,19 @@ import (
 // sequence is treated as genuinely lost and we advance, so a truly dropped
 // packet cannot stall delivery indefinitely.
 const reorderWindow = 256
+
+// reorderHold bounds how long a gap may hold back the packets behind it.
+// Reordering on these paths spans milliseconds, so a gap still open after
+// this is a lost packet. The count bound alone is reached in a fraction of a
+// second at full rate, but a stream down to keepalives and probes - an idle
+// peer, or one whose lane is waiting out a dark path - brings a dozen packets
+// a second, and one lost packet held control and data behind it for twenty
+// seconds, long enough for the sender to count the path dark (issue #12).
+// The check runs on each arrival, and an idle peer still sends a keepalive
+// every keepaliveIdlePeriod.
+//
+// ai-generated: the time bound.
+const reorderHold = 100 * time.Millisecond
 
 // Reordered RTP packets normally carry an MTU-sized payload. Larger buffers
 // are not retained after delivery so one malformed packet cannot pin a large
@@ -47,6 +62,9 @@ type reorderBuffer struct {
 	free    []*rtp.Packet
 	nextSeq uint16
 	started bool
+	// gapSince is when the packets now held started waiting on a gap, zero
+	// while none waits (ai-generated: issue #12).
+	gapSince time.Time
 }
 
 func newReorderBuffer() *reorderBuffer {
@@ -72,12 +90,21 @@ func (b *reorderBuffer) push(pkt *rtp.Packet, deliver func(*rtp.Packet)) {
 	}
 	b.pkts[pkt.SequenceNumber] = b.clone(pkt)
 
-	// Holding a full window behind a hole means the head sequence is
-	// genuinely lost: skip forward to the oldest buffered packet.
-	if len(b.pkts) > reorderWindow {
+	// Holding a full window behind a hole, or holding anything behind it for
+	// longer than reorderHold, means the head sequence is genuinely lost:
+	// skip forward to the oldest buffered packet.
+	now := time.Now()
+	if len(b.pkts) > reorderWindow || (!b.gapSince.IsZero() && now.Sub(b.gapSince) > reorderHold) {
 		b.skipToOldest()
+		b.gapSince = time.Time{}
 	}
 	b.drain(deliver)
+	switch {
+	case len(b.pkts) == 0:
+		b.gapSince = time.Time{}
+	case b.gapSince.IsZero():
+		b.gapSince = now
+	}
 }
 
 // drain pops contiguous packets starting at nextSeq.

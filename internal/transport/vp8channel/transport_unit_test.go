@@ -727,6 +727,29 @@ func TestReorderBufferRestoresOrderAndSurvivesLoss(t *testing.T) {
 	}
 }
 
+// TestReorderBufferReleasesAGapThatOutlastsTheHold is part of issue #12: the
+// reorder buffer bounded a gap only by the 256 packets that piled up behind
+// it. At full rate that is a fraction of a second; on a stream down to
+// keepalives and probes, a dozen packets a second, one lost packet held
+// control and data for twenty seconds, which the sender reads as a dark path.
+// A gap still open after the hold is a lost packet.
+//
+// ai-generated: the whole test.
+func TestReorderBufferReleasesAGapThatOutlastsTheHold(t *testing.T) {
+	b := newReorderBuffer()
+	seq := func(n uint16) *rtp.Packet { return &rtp.Packet{Header: rtp.Header{SequenceNumber: n}} }
+	if got := pushedSeqs(b, seq(10)); len(got) != 1 {
+		t.Fatalf("first packet: delivered %v", got)
+	}
+	if got := pushedSeqs(b, seq(12)); got != nil {
+		t.Fatalf("delivered %v past a gap at once", got)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := pushedSeqs(b, seq(13)); len(got) != 2 || got[0] != 12 || got[1] != 13 {
+		t.Fatalf("after the hold: delivered %v, want [12 13] past the lost 11", got)
+	}
+}
+
 func TestReorderBufferReusesPacketStorage(t *testing.T) {
 	buffer := newReorderBuffer()
 	firstInput := &rtp.Packet{
