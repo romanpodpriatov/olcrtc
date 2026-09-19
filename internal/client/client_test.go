@@ -958,7 +958,7 @@ func TestShutdownGivesUpOnStuckGoroutine(t *testing.T) {
 }
 
 // TestLivenessFallbackReestablishesSession covers the case where the provider
-// never calls back after a liveness-triggered rebuild. handleReconnect returns
+// never calls back after a liveness-triggered rebuild. onSessionDeath returns
 // straight after ln.Reconnect and relies on that callback; without a fallback,
 // sessionReady is never signalled again and every SOCKS connection fails on the
 // 60s readiness gate. The fallback proves it acted by driving a handshake over
@@ -978,7 +978,7 @@ func TestLivenessFallbackReestablishesSession(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	// Drive the real path: a liveness reconnect hands the rebuild to the
 	// provider and arms the fallback.
-	c.handleReconnect(ctx, Config{}, cancel, reconnectLiveness)
+	c.onSessionDeath(ctx, Config{}, cancel, nil)
 
 	select {
 	case <-ln.sentCh:
@@ -1015,7 +1015,7 @@ func TestLivenessFallbackSkipsWhenSessionIsBack(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c.scheduleLivenessFallback(ctx, Config{}, cancel)
+	c.armFallback(ctx, Config{}, cancel, c.recovery.generation())
 	c.waitGoroutines()
 
 	ln.mu.Lock()

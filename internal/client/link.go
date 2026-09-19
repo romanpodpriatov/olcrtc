@@ -72,7 +72,7 @@ func (c *Client) bringUpLink(ctx context.Context, cfg Config, cancel context.Can
 	link.SetShouldReconnect(func() bool { return ctx.Err() == nil })
 	link.SetReconnectCallback(func() {
 		if ctx.Err() == nil {
-			c.handleReconnect(ctx, cfg, cancel, reconnectProvider)
+			c.onProviderReconnect(ctx, cfg, cancel)
 		}
 	})
 	if connectErr := link.Connect(ctx); connectErr != nil {
@@ -334,9 +334,77 @@ func helloAnswered(err error) bool {
 		errors.Is(err, handshake.ErrFrameTooLarge)
 }
 
-func (c *Client) handleReconnect(ctx context.Context, cfg Config, cancel context.CancelFunc, reason string) {
+// onProviderReconnect re-establishes the session over the connection the
+// provider has just rebuilt, on a goroutine of its own.
+//
+// The callback runs on the provider's reconnect loop, which serves no other
+// request until it returns, and handshakes the peer does not answer take
+// over a minute to give up on: run inline, they held the loop that long. The
+// callback also takes the recovery over from a fallback started because it
+// came late, which is handshaking over the connection just replaced.
+//
+// ai-generated: the whole function (olcrtc#19).
+func (c *Client) onProviderReconnect(ctx context.Context, cfg Config, cancel context.CancelFunc) {
+	run, gen := c.recovery.take(ctx)
+	c.goTracked(func() {
+		defer c.recovery.release(gen)
+		c.handleReconnect(ctx, run, cfg, cancel, reconnectProvider)
+	})
+}
+
+// handleReconnect re-handshakes over the connection the provider has just
+// rebuilt, tearing down whatever session it finds, and hands the rebuild back
+// to the provider when those handshakes fail too. run ends when a later
+// recovery takes over.
+//
+// ai-generated: run, the teardown split out to dropSessionLocked, and the
+// rebuild after a failed retry (olcrtc#19).
+func (c *Client) handleReconnect(ctx, run context.Context, cfg Config, cancel context.CancelFunc, reason string) {
+	expect := c.recovery.generation()
 	c.reconnectMu.Lock()
 	defer c.reconnectMu.Unlock()
+	if run.Err() != nil {
+		return
+	}
+	c.dropSessionLocked(reason, nil)
+	if !c.retryHandshake(ctx, run, cfg, cancel, reason) && run.Err() == nil && c.ln != nil {
+		c.rebuildProvider(ctx, cfg, cancel, reconnectHandshake, expect)
+	}
+}
+
+// onSessionDeath gives up the session whose control stream the liveness loop
+// declared dead and hands the rebuild to the provider, whose callback then
+// drives the handshake.
+//
+// ai-generated: the whole function, the liveness half of what handleReconnect
+// was (olcrtc#19). It drops only the session that died: one a provider
+// callback has put in its place since is left alone, and so is the recovery
+// that callback runs.
+func (c *Client) onSessionDeath(ctx context.Context, cfg Config, cancel context.CancelFunc, dead *smux.Stream) {
+	expect := c.recovery.generation()
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
+	if !c.dropSessionLocked(reconnectLiveness, dead) || c.ln == nil {
+		return
+	}
+	c.rebuildProvider(ctx, cfg, cancel, reconnectLiveness, expect)
+}
+
+// dropSessionLocked tears the installed session down, or with dead set only
+// the session whose control stream that is, and reports whether it did.
+// Callers hold reconnectMu.
+//
+// ai-generated: split out of handleReconnect with the dead check (olcrtc#19);
+// the teardown is as it was.
+func (c *Client) dropSessionLocked(reason string, dead *smux.Stream) bool {
+	if dead != nil {
+		c.sessMu.RLock()
+		current := c.controlStrm == dead
+		c.sessMu.RUnlock()
+		if !current {
+			return false
+		}
+	}
 	c.health.RecordReconnect()
 	logger.Infof("client reconnect reason=%s - tearing down smux session", reason)
 	tunnelcore.ResetPeer(c.ln)
@@ -376,12 +444,7 @@ func (c *Client) handleReconnect(ctx context.Context, cfg Config, cancel context
 	if oldControl != nil {
 		_ = oldControl.Close()
 	}
-	if reason == reconnectLiveness && c.ln != nil {
-		c.ln.Reconnect(reconnectLiveness)
-		c.scheduleLivenessFallback(ctx, cfg, cancel)
-		return
-	}
-	c.retryHandshake(ctx, cfg, cancel, reason)
+	return true
 }
 
 func closeClientPair(pair *tunnelcore.SessionPair, session, controlSession *smux.Session) {
@@ -397,20 +460,48 @@ func closeClientPair(pair *tunnelcore.SessionPair, session, controlSession *smux
 	}
 }
 
-func (c *Client) scheduleLivenessFallback(ctx context.Context, cfg Config, cancel context.CancelFunc) {
-	if !c.fallbackPending.CompareAndSwap(false, true) {
-		return
+// rebuildProvider asks the provider for a new connection, whose callback
+// then drives the handshake, and arms the fallback in case that callback
+// never comes. expect is the recovery generation read before the session was
+// given up: a callback that has come since is handshaking over a connection
+// newer than this one and owns the recovery, so nothing is asked for.
+//
+// ai-generated: the whole function (olcrtc#19).
+func (c *Client) rebuildProvider(
+	ctx context.Context, cfg Config, cancel context.CancelFunc, reason string, expect uint64,
+) {
+	if c.armFallback(ctx, cfg, cancel, expect) {
+		c.ln.Reconnect(reason)
+	}
+}
+
+// armFallback re-establishes the session on its own when the provider has
+// not called back within the fallback window: a provider that silently never
+// does would otherwise leave sessionReady unsignalled for good.
+//
+// ai-generated: arming on the recovery generation, the disarm by a provider
+// callback and the rebuild when its handshakes fail too (olcrtc#19). The
+// fallback used to go by sessionEstablished alone, so a callback that had
+// come but whose handshake was still retrying did not stop it: it logged a
+// callback that never came, queued on reconnectMu behind the callback's
+// handshakes and ran its own after them. Now a callback disarms it, or stops
+// its handshakes if they have begun; and when they fail it asks the provider
+// again rather than leave the tunnel without a session and nothing retrying.
+func (c *Client) armFallback(ctx context.Context, cfg Config, cancel context.CancelFunc, expect uint64) bool {
+	run, gen, ok := c.recovery.takeIf(ctx, expect)
+	if !ok {
+		return false
 	}
 	delay := c.livenessFallback
 	if delay <= 0 {
 		delay = defaultLivenessFallback
 	}
 	c.goTracked(func() {
-		defer c.fallbackPending.Store(false)
+		defer c.recovery.release(gen)
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
 		select {
-		case <-ctx.Done():
+		case <-run.Done():
 			return
 		case <-timer.C:
 		}
@@ -420,10 +511,14 @@ func (c *Client) scheduleLivenessFallback(ctx context.Context, cfg Config, cance
 		logger.Warnf("client reconnect: no provider callback within %s - re-establishing session", delay)
 		c.reconnectMu.Lock()
 		defer c.reconnectMu.Unlock()
-		if ctx.Err() == nil && !c.sessionEstablished() {
-			c.retryHandshake(ctx, cfg, cancel, reconnectFallback)
+		if run.Err() != nil || c.sessionEstablished() {
+			return
+		}
+		if !c.retryHandshake(ctx, run, cfg, cancel, reconnectFallback) && run.Err() == nil {
+			c.rebuildProvider(ctx, cfg, cancel, reconnectHandshake, gen)
 		}
 	})
+	return true
 }
 
 func (c *Client) sessionEstablished() bool {
@@ -432,28 +527,37 @@ func (c *Client) sessionEstablished() bool {
 	return c.session != nil && !c.session.IsClosed() && c.sessionID != ""
 }
 
-func (c *Client) retryHandshake(ctx context.Context, cfg Config, cancel context.CancelFunc, reason string) {
+// retryHandshake reports whether it installed a session. It stops when the
+// reason's attempts run out or when run ends; the control loop of a session
+// it installs runs on ctx.
+//
+// ai-generated: run, the result and retryDelay (olcrtc#19).
+func (c *Client) retryHandshake(ctx, run context.Context, cfg Config, cancel context.CancelFunc, reason string) bool {
 	const (
 		initialDelay = 300 * time.Millisecond
 		maxDelay     = 5 * time.Second
 	)
 	delay := initialDelay
+	if c.retryDelay > 0 {
+		delay = c.retryDelay
+	}
 	maxAttempts := maxHandshakeAttempts(reason)
 	for attempt := 1; ; attempt++ {
-		if ctx.Err() != nil {
-			return
+		if run.Err() != nil {
+			return false
 		}
 		logger.Infof("client reconnect attempt=%d reason=%s", attempt, reason)
-		if c.tryReopenSession(ctx, cfg, cancel, attempt) {
-			return
+		if c.tryReopenSession(ctx, run, cfg, cancel, attempt) {
+			return true
 		}
 		if maxAttempts > 0 && attempt >= maxAttempts {
-			logger.Warnf("client reconnect: exhausted %d handshake attempts (reason=%s) - keeping listener up", attempt, reason)
-			return
+			logger.Warnf("client reconnect: exhausted %d handshake attempts (reason=%s) - "+
+				"asking the provider for a new connection", attempt, reason)
+			return false
 		}
 		select {
-		case <-ctx.Done():
-			return
+		case <-run.Done():
+			return false
 		case <-time.After(delay):
 		}
 		if delay < maxDelay {
@@ -476,8 +580,12 @@ func maxHandshakeAttempts(reason string) int {
 	}
 }
 
+// tryReopenSession runs one handshake. Its waits end with run; the session
+// it installs runs on ctx.
+//
+// ai-generated: run, helloTimeout and the check before installing (olcrtc#19).
 func (c *Client) tryReopenSession(
-	ctx context.Context,
+	ctx, run context.Context,
 	cfg Config,
 	cancel context.CancelFunc,
 	attempt int,
@@ -505,11 +613,13 @@ func (c *Client) tryReopenSession(
 		return false
 	}
 	control, sessionID, peerID, err := openControlStreamTimeout(
-		ctx, pair.ControlSession, c.deviceID, c.claims, handshake.DefaultTimeout,
+		run, pair.ControlSession, c.deviceID, c.claims, c.helloTimeout(),
 	)
 	if err != nil {
-		logger.Warnf("handshake on reconnect failed (attempt %d): %v", attempt,
-			c.classifyHandshakeFailure(err, conn, controlConn))
+		if run.Err() == nil {
+			logger.Warnf("handshake on reconnect failed (attempt %d): %v", attempt,
+				c.classifyHandshakeFailure(err, conn, controlConn))
+		}
 		_ = pair.Close()
 		return false
 	}
@@ -518,8 +628,14 @@ func (c *Client) tryReopenSession(
 		_ = pair.Close()
 		return false
 	}
-	if waitErr := waitForPeer(ctx, c.ln); waitErr != nil {
+	if waitErr := waitForPeer(run, c.ln); waitErr != nil {
 		logger.Warnf("wait for peer on reconnect failed (attempt %d): %v", attempt, waitErr)
+		_ = pair.Close()
+		return false
+	}
+	// A recovery that took over while this handshake ran is rebuilding the
+	// connection it ran on; it installs its own session.
+	if run.Err() != nil {
 		_ = pair.Close()
 		return false
 	}
@@ -533,6 +649,14 @@ func (c *Client) tryReopenSession(
 	c.health.RecordSession(sessionID)
 	c.startControlLoop(ctx, cfg, cancel, control)
 	return true
+}
+
+// helloTimeout is the handshake timeout of a reconnect. ai-generated (olcrtc#19).
+func (c *Client) helloTimeout() time.Duration {
+	if c.handshakeTimeout > 0 {
+		return c.handshakeTimeout
+	}
+	return handshake.DefaultTimeout
 }
 
 func (c *Client) installPairLocked(pair *tunnelcore.SessionPair) {

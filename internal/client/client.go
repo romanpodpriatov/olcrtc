@@ -44,6 +44,9 @@ const (
 	reconnectProvider = "provider"
 	reconnectLiveness = "liveness"
 	reconnectFallback = "liveness-fallback"
+	// reconnectHandshake asks the provider for a new connection after the
+	// handshakes over the one it gave went unanswered. ai-generated (olcrtc#19).
+	reconnectHandshake = "handshake"
 )
 
 const (
@@ -94,7 +97,15 @@ type Client struct {
 	socksClosed      bool
 	livenessFallback time.Duration
 	shutdownGrace    time.Duration
-	fallbackPending  atomic.Bool
+
+	// ai-generated: recovery, handshakeTimeout and retryDelay (olcrtc#19).
+	// recovery is the attempt re-establishing the session, if one is (see
+	// recovery.go). handshakeTimeout and retryDelay stand in for
+	// handshake.DefaultTimeout and the first pause between reconnect
+	// handshakes; zero means the default, and only tests set them.
+	recovery         recovery
+	handshakeTimeout time.Duration
+	retryDelay       time.Duration
 
 	// parked counts the requests waiting for a session that is not there
 	// (tunnelWhenReady, waitSessionReady). With a tun2socks in front every
