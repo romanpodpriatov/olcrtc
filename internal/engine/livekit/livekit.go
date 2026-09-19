@@ -611,6 +611,24 @@ func (s *Session) WatchConnection(ctx context.Context) {
 }
 
 func (s *Session) reconnect(ctx context.Context) error {
+	if err := s.rejoin(ctx); err != nil {
+		return err
+	}
+	s.NotifyReconnect()
+	return nil
+}
+
+// rejoin leaves the room and joins it again on refreshed credentials.
+//
+// reconnecting covers the rejoin and ends before the reconnect callback. The
+// flag holds CanSend false and keeps the room being left from queueing a
+// reconnect of its own, and the callback is where the upper layer sends on
+// the room just joined: the client's handshake, the server's close notices.
+// Held through the callback, it kept every one of those frames off the wire
+// until the callback gave up (olcrtc#19).
+//
+// ai-generated: rejoin, split out of reconnect so the flag ends before the callback.
+func (s *Session) rejoin(ctx context.Context) error {
 	s.reconnecting.Store(true)
 	defer s.reconnecting.Store(false)
 
@@ -627,11 +645,7 @@ func (s *Session) reconnect(ctx context.Context) error {
 		engine.ApplyRefreshedCredentials(creds, &s.url, &s.token, nil)
 	}
 
-	if err := s.connectSession(ctx); err != nil {
-		return err
-	}
-	s.NotifyReconnect()
-	return nil
+	return s.connectSession(ctx)
 }
 
 func (s *Session) queueReconnect() bool {

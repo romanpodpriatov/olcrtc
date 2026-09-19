@@ -245,6 +245,56 @@ func TestReconnectRefreshesCredentialsAndReplacesRoom(t *testing.T) {
 	}
 }
 
+// TestReconnectCallbackRunsOnASendableSession guards olcrtc#19. The upper
+// layer's reconnect callback is where it re-handshakes (client) or tells its
+// peers their sessions are gone (server), so it has to be able to send on the
+// room it was just handed. The rejoin used to stay marked in progress until
+// the callback returned, which held CanSend false for the whole callback: a
+// WB Stream client spent five 15 s handshakes that never got their first
+// frame out, and the server's close notices waited out their deadline.
+//
+// ai-generated: the whole test.
+func TestReconnectCallbackRunsOnASendableSession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sess, err := New(ctx, engine.Config{URL: testOldURL, Token: testOldToken})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	s, ok := sess.(*Session)
+	if !ok {
+		t.Fatalf("New() type = %T, want *Session", sess)
+	}
+	connector := newFakeConnector()
+	s.connectRoom = connector.connect
+
+	type sendable struct{ canSend, subscriber bool }
+	seen := make(chan sendable, 1)
+	s.SetReconnectCallback(func() {
+		seen <- sendable{canSend: s.CanSend(), subscriber: s.SubscriberCanSend()}
+	})
+
+	if err := s.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	go s.WatchConnection(ctx)
+	connector.callback(0).OnDisconnected()
+
+	select {
+	case got := <-seen:
+		if !got.canSend || !got.subscriber {
+			t.Fatalf("inside the reconnect callback CanSend() = %v, SubscriberCanSend() = %v, want both true",
+				got.canSend, got.subscriber)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconnect callback was not called")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+}
+
 func TestDisconnectedEndsWhenReconnectDisallowed(t *testing.T) {
 	ctx := context.Background()
 	sess, err := New(ctx, engine.Config{URL: testOldURL, Token: testOldToken})
