@@ -353,11 +353,13 @@ func (p *streamTransport) sendToPeer(peerID string, data []byte, pick func(uint3
 }
 
 // peerDataFor returns the bulk KCP of a known peer, without creating one.
+// ai-generated: lookup instead of get, and claim.
 func (p *streamTransport) peerDataFor(epoch uint32) *kcpRuntime {
-	sess := p.peers.get(epoch)
+	sess := p.peers.lookup(epoch)
 	if sess == nil {
 		return nil
 	}
+	sess.claim()
 
 	return sess.data
 }

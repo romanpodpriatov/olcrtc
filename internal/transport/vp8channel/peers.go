@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
@@ -20,13 +21,27 @@ const (
 	// in-flight handshake.
 	peerIdleTTL = 3 * time.Minute
 
-	// peerSweepInterval is how often idle peers are collected.
-	peerSweepInterval = 30 * time.Second
+	// peerSweepInterval is how often idle peers are collected. It also bounds
+	// how long an ended peer's epoch outlives retiredPeerIdle once silent,
+	// and a peer that left mid-transfer keeps retransmitting into the shared
+	// track until then.
+	//
+	// ai-generated: 30 s to 10 s, and the second half of this comment.
+	peerSweepInterval = 10 * time.Second
 
 	// maxPeers caps how many remote epochs one transport tracks at once. A
 	// hostile or badly broken room could otherwise mint epochs faster than
 	// the TTL reclaims them. Beyond the cap the oldest peer is evicted.
 	maxPeers = 64
+
+	// retiredPeerIdle is how long a peer whose server session has ended may
+	// stay silent before its KCP state is released, instead of peerIdleTTL.
+	// A client still on the epoch sends a keepalive at least every
+	// forceKeepalivePeriod, so five missed beats is a client that has moved
+	// on; one that is still heard may be retrying its handshake on the epoch.
+	//
+	// ai-generated: the constant and its comment.
+	retiredPeerIdle = 5 * forceKeepalivePeriod
 )
 
 // peerSession is everything one remote epoch owns on the server side: its
@@ -51,6 +66,11 @@ type peerSession struct {
 
 	// lastSeen is a UnixNano timestamp refreshed by every inbound frame.
 	lastSeen int64
+
+	// retired is set when the server's session on this epoch has ended and
+	// cleared by the next send, which means a new one owns it.
+	// ai-generated: the field and its comment.
+	retired atomic.Bool
 }
 
 // controlRuntime returns the peer's control KCP if one has been created.
@@ -71,6 +91,14 @@ func (s *peerSession) touch(now time.Time) {
 	s.lastSeen = now.UnixNano()
 }
 
+// claim marks the epoch as owned by a server session again.
+// ai-generated: the whole method.
+func (s *peerSession) claim() {
+	if s.retired.Load() {
+		s.retired.Store(false)
+	}
+}
+
 // close releases both KCP sessions and stops the writer pump. Safe to call
 // more than once.
 // ai-generated: fence control creation before detaching and closing both runtimes.
@@ -82,9 +110,9 @@ func (s *peerSession) close() {
 		s.control = nil
 		s.controlMu.Unlock()
 
-		s.data.close()
+		s.data.abortPeer()
 		if control != nil {
-			control.close()
+			control.abortPeer()
 		}
 
 		close(s.done)
@@ -116,7 +144,9 @@ type peerTable struct {
 	createMu sync.Mutex
 }
 
-// get returns the session for epoch, refreshing its idle timer.
+// get returns the session for epoch, refreshing its idle timer. Only the
+// inbound path uses it, so the timer measures how long the peer has been
+// silent; the send paths use lookup.
 func (t *peerTable) get(epoch uint32) *peerSession {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -127,6 +157,17 @@ func (t *peerTable) get(epoch uint32) *peerSession {
 	}
 
 	return sess
+}
+
+// lookup returns the session for epoch without refreshing its idle timer:
+// the server writing to an epoch says nothing about the peer still being
+// there.
+// ai-generated: the whole method.
+func (t *peerTable) lookup(epoch uint32) *peerSession {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	return t.sessions[epoch]
 }
 
 // add installs a freshly created session, evicting the oldest peer when the
@@ -186,16 +227,20 @@ func (t *peerTable) evictOldestLocked() {
 	oldest.close()
 }
 
-// sweep evicts every session idle for longer than ttl.
-func (t *peerTable) sweep(ttl time.Duration) {
-	cutoff := time.Now().Add(-ttl).UnixNano()
+// sweep evicts every session idle for longer than ttl, and every retired one
+// idle for longer than retiredTTL.
+// ai-generated: added retiredTTL and the retired cutoff.
+func (t *peerTable) sweep(ttl, retiredTTL time.Duration) {
+	now := time.Now()
+	cutoff := now.Add(-ttl).UnixNano()
+	retiredCutoff := now.Add(-retiredTTL).UnixNano()
 
 	t.mu.Lock()
 
 	var stale []*peerSession
 
 	for epoch, sess := range t.sessions {
-		if sess.lastSeen < cutoff {
+		if sess.lastSeen < cutoff || (sess.retired.Load() && sess.lastSeen < retiredCutoff) {
 			stale = append(stale, sess)
 			delete(t.sessions, epoch)
 		}
@@ -204,9 +249,29 @@ func (t *peerTable) sweep(ttl time.Duration) {
 	t.mu.Unlock()
 
 	for _, sess := range stale {
-		logger.Infof("vp8channel: peer session idle for %s, releasing epoch=0x%08x", ttl, sess.epoch)
+		logger.Infof("vp8channel: peer session idle, releasing epoch=0x%08x", sess.epoch)
 		sess.close()
 	}
+}
+
+// releaseIdle detaches sess and closes it if it is still the table's session
+// for its epoch and has been silent for longer than idle. It reports whether
+// it did.
+// ai-generated: the whole method.
+func (t *peerTable) releaseIdle(sess *peerSession, idle time.Duration) bool {
+	cutoff := time.Now().Add(-idle).UnixNano()
+
+	t.mu.Lock()
+	if t.sessions[sess.epoch] != sess || sess.lastSeen >= cutoff {
+		t.mu.Unlock()
+		return false
+	}
+	delete(t.sessions, sess.epoch)
+	t.mu.Unlock()
+
+	sess.close()
+
+	return true
 }
 
 // closeAll releases every session and marks the table closed so no further
@@ -308,6 +373,15 @@ func (p *streamTransport) peerControlFor(epoch uint32) *kcpRuntime {
 		return nil
 	}
 
+	return p.controlOf(sess)
+}
+
+// controlOf returns sess's control KCP, creating it on first use.
+// ai-generated: split out of peerControlFor so the send path can reach it
+// without creating a peer.
+func (p *streamTransport) controlOf(sess *peerSession) *kcpRuntime {
+	epoch := sess.epoch
+
 	sess.controlMu.Lock()
 	defer sess.controlMu.Unlock()
 
@@ -355,7 +429,7 @@ func (p *streamTransport) sweepPeers() {
 		case <-p.closeCh:
 			return
 		case <-ticker.C:
-			p.peers.sweep(peerIdleTTL)
+			p.peers.sweep(peerIdleTTL, retiredPeerIdle)
 		}
 	}
 }

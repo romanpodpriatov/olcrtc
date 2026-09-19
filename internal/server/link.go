@@ -231,6 +231,7 @@ func (s *Server) closePeerRouting(teardown peerRoutingTeardown) {
 	}
 	for _, peer := range teardown.peers {
 		s.closePeerSession(peer, "reconnect")
+		s.retirePeer(peer.peerID) // ai-generated: the transport outlives a provider reconnect
 	}
 	s.closeAllUDPFlows()
 }

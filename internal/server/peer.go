@@ -309,7 +309,11 @@ func (s *Server) goTracked(fn func()) {
 func (s *Server) onPeerData(peerID string, data []byte) {
 	peer := s.getPeerSession(peerID)
 	if peer == nil {
-		s.onData(data)
+		// Not in peer-routing mode: fall back to the single data conn.
+		// ai-generated: a routed peer's frame never belongs to the singleton path.
+		if s.peerLn == nil {
+			s.onData(data)
+		}
 		return
 	}
 	tunnelcore.PushData(peer.dataConn(), data)
@@ -503,19 +507,22 @@ func (s *Server) waitPeerHandshake(peer *peerSession) bool {
 	}
 }
 
+// removePeer ends peer if it is still the session for its peer ID, and then
+// tells the transport, after the CLOSE notification has gone out.
+// ai-generated: only the owning session retires the epoch, after teardown.
 func (s *Server) removePeer(peer *peerSession, reason string) {
 	if peer == nil {
 		return
 	}
 	s.sessMu.Lock()
-	current := s.peerSessions[peer.peerID] == peer
-	if current {
-		delete(s.peerSessions, peer.peerID)
+	if s.peerSessions[peer.peerID] != peer {
+		s.sessMu.Unlock()
+		return
 	}
+	delete(s.peerSessions, peer.peerID)
 	s.sessMu.Unlock()
-	if current {
-		s.closePeerSession(peer, reason)
-	}
+	s.closePeerSession(peer, reason)
+	s.retirePeer(peer.peerID)
 }
 
 func (s *Server) closePeerSession(peer *peerSession, reason string) {
