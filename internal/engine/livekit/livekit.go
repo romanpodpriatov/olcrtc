@@ -85,6 +85,9 @@ type roomHandle interface {
 	// publisherReady reports whether a data publish would go out now
 	// instead of waiting in the SDK for the publisher peer connection.
 	publisherReady() bool
+	// disconnectReason is why the server ended the session, as the
+	// protocol names it. ai-generated (olcrtc#19).
+	disconnectReason() string
 }
 
 type sdkRoom struct {
@@ -190,6 +193,15 @@ func (r *sdkRoom) publisherReady() bool {
 	}
 	sctp := pc.SCTP()
 	return sctp != nil && sctp.State() == webrtc.SCTPTransportStateConnected
+}
+
+// disconnectReason reads the reason the SDK recorded when the room ended.
+// ai-generated (olcrtc#19).
+func (r *sdkRoom) disconnectReason() string {
+	if r.room == nil {
+		return "UNKNOWN_REASON"
+	}
+	return r.room.DisconnectReason().String()
 }
 
 type connectRoomFunc func(
@@ -330,6 +342,9 @@ func (s *Session) connectSession(ctx context.Context) error {
 	// can be kicked by the next one. Neither may queue a reconnect of the
 	// room that replaced it.
 	gen := s.joinGen.Add(1)
+	// ai-generated: joined, so the end of the room this join made is logged
+	// with its reason (olcrtc#19).
+	var joined atomic.Pointer[roomHandle]
 	roomCB := &lksdk.RoomCallback{
 		ParticipantCallback: lksdk.ParticipantCallback{
 			OnDataPacket: s.handleDataPacket,
@@ -347,8 +362,25 @@ func (s *Session) connectSession(ctx context.Context) error {
 			if s.joinGen.Load() != gen || s.closed.Load() || s.reconnecting.Load() {
 				return
 			}
+			var room roomHandle
+			if p := joined.Load(); p != nil {
+				room = *p
+			}
+			logRoomDropped(room)
 			if !s.queueReconnect() {
 				s.signalEnded("disconnected from livekit")
+			}
+		},
+		// ai-generated: OnReconnecting and OnReconnected (olcrtc#19). The SDK
+		// resumes a connection it lost before it gives up on the room.
+		OnReconnecting: func() {
+			if s.joinGen.Load() == gen {
+				logger.Infof("livekit: connection to the room lost, the SDK is resuming it")
+			}
+		},
+		OnReconnected: func() {
+			if s.joinGen.Load() == gen {
+				logger.Infof("livekit: connection to the room resumed")
 			}
 		},
 	}
@@ -366,6 +398,7 @@ func (s *Session) connectSession(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("connect to room: %w", err)
 	}
+	joined.Store(&room)
 
 	// ai-generated: leaving a room that lands after shutdown.
 	if !s.setRoom(room) {
@@ -373,6 +406,19 @@ func (s *Session) connectSession(ctx context.Context) error {
 		return ErrSessionClosed
 	}
 	return s.publishPendingTracks()
+}
+
+// logRoomDropped says why the room ended the session, as the server put it:
+// WB Stream has closed a server's connection with nothing in the log to say
+// why (olcrtc#19). room is nil when the room ended before its join returned.
+//
+// ai-generated: the whole function.
+func logRoomDropped(room roomHandle) {
+	reason := "UNKNOWN_REASON"
+	if room != nil {
+		reason = room.disconnectReason()
+	}
+	logger.Infof("livekit: disconnected from the room, reason=%s", reason)
 }
 
 // joinRoom runs join and waits for it, for ctx or for the session to close.

@@ -1,8 +1,12 @@
 package livekit
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,6 +36,8 @@ type fakeRoom struct {
 	// ai-generated: gone and publisherDown.
 	gone          chan struct{}
 	publisherDown bool
+	// ai-generated: reason (olcrtc#19).
+	reason string
 }
 
 func newFakeRoom() *fakeRoom {
@@ -85,6 +91,12 @@ func (r *fakeRoom) publisherReady() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return !r.publisherDown
+}
+
+func (r *fakeRoom) disconnectReason() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reason
 }
 
 func (r *fakeRoom) setPublisherDown(down bool) {
@@ -293,6 +305,64 @@ func TestReconnectCallbackRunsOnASendableSession(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
+}
+
+// A room the server ends is logged with the reason the server gave, the only
+// clue to why WB Stream drops a connection (olcrtc#19).
+//
+// ai-generated: the whole test.
+func TestRoomDropIsLoggedWithItsReason(t *testing.T) {
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess, err := New(ctx, engine.Config{URL: testOldURL, Token: testOldToken})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	s, ok := sess.(*Session)
+	if !ok {
+		t.Fatalf("New() type = %T, want *Session", sess)
+	}
+	connector := newFakeConnector()
+	s.connectRoom = connector.connect
+	if err := s.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	go s.WatchConnection(ctx)
+
+	room := connector.room(0)
+	room.mu.Lock()
+	room.reason = "MEDIA_FAILURE"
+	room.mu.Unlock()
+	connector.callback(0).OnDisconnected()
+	waitFor(t, func() bool { return connector.count() == 2 })
+	if got := buf.String(); !strings.Contains(got, "reason=MEDIA_FAILURE") {
+		t.Fatalf("log after the room dropped us = %q, want the reason", got)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+// lockedBuffer is a log destination safe for the goroutines that write it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func TestDisconnectedEndsWhenReconnectDisallowed(t *testing.T) {
