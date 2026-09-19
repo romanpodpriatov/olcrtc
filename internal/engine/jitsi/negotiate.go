@@ -245,6 +245,9 @@ func (s *Session) preparePeerConnection(
 ) error {
 	neg := jSess.Negotiator()
 	neg.PC = pc
+	// ai-generated: this call. Every path to a PeerConnection (first join,
+	// rejoin, full reconnect) answers the session-initiate cached here.
+	s.noteBridgeSources(neg.JingleStanza)
 	neg.OnIceConnectionStateChange = func(state webrtc.ICEConnectionState) {
 		logger.Debugf("jitsi ICE state: %s", state)
 	}
@@ -370,7 +373,11 @@ func (s *Session) handleRemoteTrack(track *webrtc.TrackRemote, recv *webrtc.RTPR
 		return
 	}
 	ssrc := uint32(track.SSRC())
-	if !s.peerVideoSSRC.CompareAndSwap(0, ssrc) && s.peerVideoSSRC.Load() != ssrc {
+	// ai-generated: the bridge check. The bridge's bandwidth probes arrive
+	// on a video source of its own, sometimes ahead of the peer's first
+	// packet: latching that one would drain the peer's stream.
+	if s.isBridgeSSRC(ssrc) ||
+		(!s.peerVideoSSRC.CompareAndSwap(0, ssrc) && s.peerVideoSSRC.Load() != ssrc) {
 		go drainTrack(track)
 		return
 	}
