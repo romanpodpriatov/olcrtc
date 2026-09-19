@@ -92,8 +92,10 @@ type dataLane struct {
 	// spell, the rate the spell's cap is cut from.
 	darkRate float64
 
-	// pace is the cap the lane keeps once it has been dark.
-	pace pace
+	// pace is the cap the lane keeps once it has been dark, frames the one
+	// it keeps on a path that loses packets.
+	pace   pace
+	frames frameCap
 }
 
 // flush writes this tick's data through write and reports whether a sample
@@ -102,10 +104,25 @@ type dataLane struct {
 func (l *dataLane) flush(p *streamTransport, write func([]byte) bool) bool {
 	now := monoNow()
 	if !l.watch(p, now) && l.pace.grow(now, cmp.Or(p.growEvery, defaultGrowEvery), p.fullRate()) {
-		l.resize()
+		l.resize(p)
 	}
 	acked := l.sendAcks(p, write)
-	return l.send(p, now, write) || acked
+	sent := l.send(p, now, write)
+	if l.seen != nil {
+		if share, changed := l.frames.judge(&l.seen.delivery, p.batchSize); changed {
+			l.resize(p)
+			logger.Infof("vp8channel: %s: %d%% of pushed packets answered, %s", l.name, int(share*100), l.frameNote())
+		}
+	}
+	return sent || acked
+}
+
+// frameNote says what the frame cap is now, for the log.
+func (l *dataLane) frameNote() string {
+	if l.frames.limit == 0 {
+		return "full frames again"
+	}
+	return fmt.Sprintf("at most %d packets a frame from now", l.frames.limit)
 }
 
 // sendAcks writes the queued packets that only acknowledge the peer, in one
@@ -143,7 +160,7 @@ func (l *dataLane) watch(p *streamTransport, now int64) bool {
 		if l.seen != nil {
 			l.seen.hold(0)
 		}
-		l.seen, l.pushSince, l.darkSince, l.pace = conn, 0, 0, pace{}
+		l.seen, l.pushSince, l.darkSince, l.pace, l.frames = conn, 0, 0, pace{}, frameCap{}
 	}
 	if conn == nil {
 		return false
@@ -157,12 +174,18 @@ func (l *dataLane) watch(p *streamTransport, now int64) bool {
 		l.darkSince, l.darkRate = now, l.pace.sentRate(now)
 		conn.hold(cmp.Or(p.probeEvery, defaultProbeEvery))
 		l.sift()
-		logger.Infof("vp8channel: %s: nothing acknowledged for %s, holding pushes back until the peer answers",
-			l.name, time.Duration(now-l.pushSince).Round(time.Millisecond))
+		frames := ""
+		if l.frames.halve(p.batchSize) {
+			l.resize(p)
+			frames = ", " + l.frameNote()
+		}
+		logger.Infof("vp8channel: %s: nothing acknowledged for %s, holding pushes back until the peer answers%s",
+			l.name, time.Duration(now-l.pushSince).Round(time.Millisecond), frames)
 	case !dark && l.darkSince != 0:
 		conn.hold(0)
 		l.settle(p, now)
 		l.darkSince = 0
+		l.frames.forget()
 	}
 	return dark
 }
@@ -175,21 +198,28 @@ func (l *dataLane) settle(p *streamTransport, now int64) {
 	held := time.Duration(now - l.darkSince)
 	after := ""
 	if held >= cmp.Or(p.blackoutAfter, defaultBlackoutAfter)/2 && l.pace.slow(now, l.darkRate, p.fullRate()) {
-		l.resize()
+		l.resize(p)
 		after = fmt.Sprintf(", at most %d KiB/s from now", int(l.pace.rate)>>10)
 	}
 	logger.Infof("vp8channel: %s: the peer answers again after %s dark%s", l.name, held.Round(time.Millisecond), after)
 }
 
-// resize sets the KCP send window to what the lane writes in capQueue at its
-// cap, or back to the default without one.
-func (l *dataLane) resize() {
+// resize sets the KCP send window to what the lane writes in capQueue at the
+// lower of its caps, or back to the default without one.
+func (l *dataLane) resize(p *streamTransport) {
 	if l.window == nil {
 		return
 	}
 	segments, _ := kcpWindow()
-	if l.pace.rate > 0 {
-		segments = min(max(int(l.pace.rate*capQueue.Seconds())/kcpMTU, minCapWindow), segments)
+	rate := l.pace.rate
+	if l.frames.limit > 0 {
+		frameRate := float64(l.frames.limit*kcpMTU) * float64(time.Second) / float64(p.frameInterval)
+		if rate == 0 || frameRate < rate {
+			rate = frameRate
+		}
+	}
+	if rate > 0 {
+		segments = min(max(int(rate*capQueue.Seconds())/kcpMTU, minCapWindow), segments)
 	}
 	l.window(segments)
 }
@@ -205,7 +235,7 @@ func (p *streamTransport) fullRate() float64 {
 // the transport batches and the cap allows, notes when it carried the first
 // unanswered push, and reports whether a sample went out.
 func (l *dataLane) send(p *streamTransport, now int64, write func([]byte) bool) bool {
-	limit := p.batchSize
+	limit := cmp.Or(l.frames.limit, p.batchSize)
 	if allow := l.pace.allow(now); allow >= 0 {
 		if allow == 0 {
 			l.pace.held = l.pace.held || l.pending != nil || len(l.out) > 0
@@ -225,7 +255,7 @@ func (l *dataLane) send(p *streamTransport, now int64, write func([]byte) bool) 
 		sample = frame.data
 		defer frame.release()
 	}
-	if write(sample) && l.pushSince == 0 && samplePushes(sample) {
+	if write(sample) && l.notePushes(sample) && l.pushSince == 0 {
 		l.pushSince = now
 	}
 	l.pace.wrote(now, len(sample))
@@ -267,7 +297,7 @@ func (l *dataLane) sift() {
 func (l *dataLane) takeFresh(now int64) *packetBuffer {
 	for range cap(l.out) + 1 {
 		frame := l.take()
-		if frame == nil || l.pace.rate == 0 || now-frame.queued <= 2*int64(capQueue) ||
+		if frame == nil || (l.pace.rate == 0 && l.frames.limit == 0) || now-frame.queued <= 2*int64(capQueue) ||
 			(len(frame.data) > epochHdrLen && answers(frame.data[epochHdrLen:])) {
 			return frame
 		}
@@ -301,15 +331,23 @@ func (l *dataLane) release() {
 	}
 }
 
-// samplePushes reports whether a data sample, one queued packet or a batch
-// of them behind the epoch header, holds a KCP push segment.
-func samplePushes(sample []byte) bool {
+// notePushes counts the packets of a written data sample, one queued packet
+// or a batch of them behind the epoch header, that hold a KCP push, for the
+// frame cap, and reports whether any did.
+func (l *dataLane) notePushes(sample []byte) bool {
 	if len(sample) <= epochHdrLen {
 		return false
 	}
 	found := false
 	splitKCPPayload(sample[epochHdrLen:], func(packet []byte) {
-		found = found || (len(packet) >= wireCRCLen && pushes(packet[:len(packet)-wireCRCLen]))
+		if len(packet) < wireCRCLen {
+			return
+		}
+		st := stampsOf(packet[:len(packet)-wireCRCLen])
+		if st.pushed && l.seen != nil {
+			l.frames.pushed(&l.seen.delivery, st.push)
+		}
+		found = found || st.pushed
 	})
 	return found
 }

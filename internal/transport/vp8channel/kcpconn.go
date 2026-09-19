@@ -84,6 +84,11 @@ type kcpConn struct {
 	holdEvery atomic.Int64
 	probeAt   atomic.Int64
 
+	// delivery counts the packets with a push the data lane writes and the
+	// acknowledgements that come back for them, for the lane's frame cap.
+	// ai-generated: issue #12.
+	delivery deliveryTrack
+
 	mu        sync.Mutex
 	rDeadline time.Time
 	wDeadline time.Time
@@ -183,6 +188,9 @@ func (c *kcpConn) deliver(payload []byte) {
 	}
 	if answers(body) { // ai-generated: issue #12
 		c.lastAck.Store(monoNow())
+	}
+	if st := stampsOf(body); st.acked { // ai-generated: issue #12
+		c.delivery.count(st.ack, 0, 1)
 	}
 	packet := acquirePacketBuffer(&c.inPools, len(body))
 	copy(packet.data, body)
