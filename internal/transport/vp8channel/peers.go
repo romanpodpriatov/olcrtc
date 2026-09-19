@@ -71,6 +71,19 @@ func (s *peerSession) touch(now time.Time) {
 	s.lastSeen = now.UnixNano()
 }
 
+// readdress stamps local, the transport's new epoch, into every frame the
+// session sends from now on. ai-generated (olcrtc#19).
+func (s *peerSession) readdress(token, local uint32) {
+	s.data.setHeader(buildEpochHeaderTo(token, local, s.epoch))
+
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+
+	if s.control != nil {
+		s.control.setHeader(buildEpochHeaderTo(token, local|controlEpochFlag, s.epoch|controlEpochFlag))
+	}
+}
+
 // close releases both KCP sessions and stops the writer pump. Safe to call
 // more than once.
 // ai-generated: fence control creation before detaching and closing both runtimes.
@@ -223,6 +236,19 @@ func (t *peerTable) closeAll() {
 	}
 }
 
+// snapshot returns the sessions tracked now. ai-generated (olcrtc#19).
+func (t *peerTable) snapshot() []*peerSession {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	sessions := make([]*peerSession, 0, len(t.sessions))
+	for _, sess := range t.sessions {
+		sessions = append(sessions, sess)
+	}
+
+	return sessions
+}
+
 // len reports how many peers are currently tracked.
 func (t *peerTable) len() int {
 	t.mu.RLock()
@@ -343,6 +369,28 @@ func (p *streamTransport) peerControlFor(epoch uint32) *kcpRuntime {
 	logger.Infof("vp8channel: per-peer control KCP created peerID=%s", peerID)
 
 	return control
+}
+
+// readdressPeers carries the epoch restartPlanes has just rotated into every
+// per-peer session. A session stamps the epoch of its creation into all it
+// sends, so a server whose provider rebuilt went on answering its clients
+// under the old epoch: a client bound to that epoch kept seeing its peer
+// alive, never read the rebuild as a restart, and sat out the whole control
+// liveness window instead (olcrtc#19). The KCP conversations go on, so the
+// close notice the server sends a peer after its rebuild still reaches it.
+//
+// Holding createMu orders this against peerSessionFor: a session is either
+// in the table by now or reads the new epoch when it is built.
+//
+// ai-generated: the whole function (olcrtc#19).
+func (p *streamTransport) readdressPeers() {
+	p.peers.createMu.Lock()
+	defer p.peers.createMu.Unlock()
+
+	local := p.localEpochValue()
+	for _, sess := range p.peers.snapshot() {
+		sess.readdress(p.bindingToken, local)
+	}
 }
 
 // sweepPeers evicts idle peer sessions until the transport closes.

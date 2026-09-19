@@ -17,7 +17,10 @@
 // peerRestartGrace, that COULD mean the server restarted and rejoined the SFU -
 // but in a shared room it just as easily means an unrelated participant (a
 // second olcrtc client) joined or reconnected and the SFU is broadcasting its
-// epoch to everyone. Epoch churn alone cannot tell the two apart.
+// epoch to everyone. Epoch churn alone cannot tell the two apart. A server
+// whose provider rebuilds rotates its epoch into every frame it sends from
+// then on, its per-peer sessions' too (readdressPeers): one frame left under
+// the old epoch keeps the latched peer looking alive.
 //
 // So a rebuild also requires corroboration: linkUnhealthy, pushed in by the
 // client's own control-plane liveness loop through NotifyLinkHealth. A real
@@ -427,13 +430,15 @@ func (p *streamTransport) ResetPeer() {
 // restartPlanes rotates the data epoch and restarts both KCP planes on it.
 // controlEpochValue() derives live from the new data epoch, so the control
 // header follows automatically and the peer re-correlates the two by
-// arithmetic.
+// arithmetic. On the server the per-peer sessions go on under the new epoch
+// too (see readdressPeers).
 func (p *streamTransport) restartPlanes() {
 	p.peerConfirmed.Store(false)
 	p.peerSeen.Store(false)
 	p.peerEpoch.Store(0)
 	p.data.restart(p.rotateEpochHeader())
 	p.control.restart(p.controlEpochHeader())
+	p.readdressPeers()
 }
 
 // PeerSeen implements transport.PeerObserver: a frame with our binding token

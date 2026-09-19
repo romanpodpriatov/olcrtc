@@ -52,10 +52,11 @@ type kcpConn struct {
 
 	// epochHdr is prepended to every outgoing KCP packet so that the peer
 	// can detect a session restart on our side (see transport.go for the
-	// layout). The src/token portion is stable for the lifetime of this
-	// kcpConn; the dst portion can be re-pointed via setHeader once the
+	// layout). The dst portion can be re-pointed via setHeader once the
 	// remote peer's epoch is learned, so downlink/uplink can be addressed
-	// to a specific participant instead of broadcast. Guarded by hdrMu.
+	// to a specific participant instead of broadcast; a server's per-peer
+	// session has its src re-pointed too when the server's epoch rotates
+	// (readdressPeers). Guarded by hdrMu.
 	hdrMu    sync.RWMutex
 	epochHdr [epochHdrLen]byte
 
