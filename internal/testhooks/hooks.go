@@ -6,6 +6,7 @@
 package testhooks
 
 import (
+	"context"
 	"os"
 	"time"
 
@@ -19,6 +20,10 @@ const Enabled = true
 
 // bridgeDelayEnv names the variable BeforeBridgeOpen reads.
 const bridgeDelayEnv = "OLCRTC_TEST_BRIDGE_DELAY"
+
+// providerDropEnv names the variable DropProviderAfter reads. ai-generated
+// (olcrtc#19).
+const providerDropEnv = "OLCRTC_TEST_PROVIDER_DROP_AFTER"
 
 // BeforeBridgeOpen sleeps for OLCRTC_TEST_BRIDGE_DELAY (a Go duration) before
 // a Jitsi session opens its bridge. The gate's S6 uses it to make a server
@@ -41,4 +46,37 @@ func BeforeBridgeOpen() {
 	}
 	logger.Infof("testhooks: bridge opens %s late", d)
 	time.Sleep(d)
+}
+
+// DropProviderAfter calls drop once, OLCRTC_TEST_PROVIDER_DROP_AFTER (a Go
+// duration) after it is called, unless ctx ends first. A server calls it once
+// its link is up, with a drop that makes its provider rebuild, as a relay that
+// cuts the server's connection does: the WB Stream rebuild the client took
+// three minutes to get over in olcrtc#19. An unset, zero or negative value
+// drops nothing; so does one that is not a duration, which is logged.
+//
+// ai-generated: the whole function (olcrtc#19).
+func DropProviderAfter(ctx context.Context, drop func()) {
+	v := os.Getenv(providerDropEnv)
+	if v == "" {
+		return
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		logger.Warnf("testhooks: %s=%q ignored: %v", providerDropEnv, v, err)
+		return
+	}
+	if d <= 0 {
+		return
+	}
+	logger.Infof("testhooks: the provider drops in %s", d)
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+	logger.Infof("testhooks: dropping the provider")
+	drop()
 }

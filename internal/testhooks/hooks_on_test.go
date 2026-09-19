@@ -3,6 +3,7 @@
 package testhooks
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -31,6 +32,41 @@ func TestNoDelayUnlessPositive(t *testing.T) {
 			BeforeBridgeOpen()
 			if d := time.Since(start); d > atOnce {
 				t.Fatalf("BeforeBridgeOpen slept %v on %q", d, v)
+			}
+		})
+	}
+}
+
+// ai-generated: the provider drop's tests (olcrtc#19).
+
+func TestProviderDropIsHonoured(t *testing.T) {
+	t.Setenv("OLCRTC_TEST_PROVIDER_DROP_AFTER", "100ms")
+	start := time.Now()
+	dropped := 0
+	DropProviderAfter(context.Background(), func() { dropped++ })
+	if d := time.Since(start); d < 100*time.Millisecond {
+		t.Fatalf("DropProviderAfter dropped after %v, want >= 100ms", d)
+	}
+	if dropped != 1 {
+		t.Fatalf("drops = %d, want 1", dropped)
+	}
+}
+
+func TestProviderDropStopsWithTheServer(t *testing.T) {
+	t.Setenv("OLCRTC_TEST_PROVIDER_DROP_AFTER", "1h")
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	DropProviderAfter(ctx, func() { t.Error("dropped after the context ended") })
+}
+
+func TestNoDropUnlessPositive(t *testing.T) {
+	for _, v := range []string{"0s", "-2s", "2"} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("OLCRTC_TEST_PROVIDER_DROP_AFTER", v)
+			start := time.Now()
+			DropProviderAfter(context.Background(), func() { t.Errorf("dropped on %q", v) })
+			if d := time.Since(start); d > atOnce {
+				t.Fatalf("DropProviderAfter waited %v on %q", d, v)
 			}
 		})
 	}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
+	"github.com/openlibrecommunity/olcrtc/internal/testhooks"
 	"github.com/openlibrecommunity/olcrtc/internal/transport"
 	"github.com/openlibrecommunity/olcrtc/internal/tunnelcore"
 )
@@ -54,6 +55,11 @@ func (s *Server) bringUpLink(ctx context.Context, cfg Config, cancel context.Can
 	logger.Infof("Link connected")
 	s.logPeersLine()
 	s.goTracked(func() { ln.WatchConnection(ctx) })
+	// ai-generated: a test build's provider drop (olcrtc#19). Enabled is a
+	// constant, so a release build compiles nothing here.
+	if testhooks.Enabled {
+		s.goTracked(func() { testhooks.DropProviderAfter(ctx, func() { ln.Reconnect("testhook") }) })
+	}
 	return nil
 }
 

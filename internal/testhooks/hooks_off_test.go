@@ -3,6 +3,7 @@
 package testhooks
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -20,4 +21,11 @@ func TestEnvIgnoredWithoutTheTag(t *testing.T) {
 	if d := time.Since(start); d > atOnce {
 		t.Fatalf("an untagged build slept %v on OLCRTC_TEST_BRIDGE_DELAY", d)
 	}
+}
+
+// A build without the tag drops no provider, whatever the variable says.
+// ai-generated (olcrtc#19).
+func TestProviderDropIgnoredWithoutTheTag(t *testing.T) {
+	t.Setenv("OLCRTC_TEST_PROVIDER_DROP_AFTER", "1ms")
+	DropProviderAfter(context.Background(), func() { t.Error("an untagged build dropped its provider") })
 }

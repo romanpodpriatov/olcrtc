@@ -1,6 +1,7 @@
 package testhooks
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -24,5 +25,16 @@ func TestBeforeBridgeOpenIsFreeWithoutDelay(t *testing.T) {
 func TestEnabledMatchesTheBuild(t *testing.T) {
 	if Enabled != tagged {
 		t.Fatalf("Enabled = %v, want %v for this build", Enabled, tagged)
+	}
+}
+
+// Whatever the build, DropProviderAfter must return at once, dropping
+// nothing, when no drop is configured. ai-generated (olcrtc#19).
+func TestDropProviderAfterIsFreeWithoutDelay(t *testing.T) {
+	t.Setenv("OLCRTC_TEST_PROVIDER_DROP_AFTER", "")
+	start := time.Now()
+	DropProviderAfter(context.Background(), func() { t.Error("dropped with no drop configured") })
+	if d := time.Since(start); d > atOnce {
+		t.Fatalf("DropProviderAfter took %v with no drop configured", d)
 	}
 }
