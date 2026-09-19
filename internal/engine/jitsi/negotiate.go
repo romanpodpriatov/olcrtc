@@ -9,6 +9,7 @@ import (
 	"time"
 
 	pioninterceptor "github.com/pion/interceptor"
+	"github.com/pion/interceptor/pkg/twcc"
 	"github.com/pion/webrtc/v4"
 	"github.com/zarazaex69/j"
 
@@ -133,16 +134,35 @@ func newSettingEngine(resolver protect.Lookup) (webrtc.SettingEngine, error) {
 	return settings, nil
 }
 
+// newConferenceAPI builds the conference PeerConnection API. pion's default
+// interceptors stay off: the report ones probe the DTLS transport on a tick
+// and flood the log until DTLS is up. The transport-cc feedback generator is
+// the one JVB cannot do without. Its bandwidth estimator for an endpoint runs
+// on that feedback: without any it takes the time since its first packet as
+// the round trip, cuts the estimate by a fifth every second from 3 s on to
+// its 30 kbps floor, and stops forwarding the endpoint any video above that,
+// so a tunnel direction goes dark mid-transfer (issue #12). The generator
+// starts on the first tagged packet, which cannot arrive before DTLS.
+//
+// ai-generated: the media engine and the transport-cc feedback generator.
 func newConferenceAPI(resolver protect.Lookup) (*webrtc.API, error) {
 	settings, err := newSettingEngine(resolver)
 	if err != nil {
 		return nil, err
 	}
-	// JVB performs RTCP feedback aggregation, so avoid default interceptor
-	// probes before DTLS starts.
+	media := &webrtc.MediaEngine{}
+	if err = media.RegisterDefaultCodecs(); err != nil {
+		return nil, fmt.Errorf("register codecs: %w", err)
+	}
 	registry := &pioninterceptor.Registry{}
+	err = webrtc.ConfigureTWCCSenderWithOptions(media, registry,
+		twcc.WithLoggerFactory(logger.NewPionLoggerFactory()))
+	if err != nil {
+		return nil, fmt.Errorf("transport-cc feedback: %w", err)
+	}
 	return webrtc.NewAPI(
 		webrtc.WithSettingEngine(settings),
+		webrtc.WithMediaEngine(media),
 		webrtc.WithInterceptorRegistry(registry),
 	), nil
 }
