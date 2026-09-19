@@ -150,7 +150,10 @@ func (s *Session) acceptEpochFrame(payload []byte) ([]byte, bool) {
 	if prev == 0 {
 		s.peerEpoch.Store(senderEpoch)
 	} else if prev != senderEpoch {
-		s.peerEpoch.CompareAndSwap(prev, senderEpoch)
+		// ai-generated: a fresh peer starts a fresh relay window (olcrtc#15).
+		if s.peerEpoch.CompareAndSwap(prev, senderEpoch) {
+			s.resetRelayWindows()
+		}
 		if s.inReconnectGrace() {
 			logger.Debugf("jitsi: peer epoch changed during grace period (0x%08x -> 0x%08x)",
 				prev, senderEpoch)
@@ -177,7 +180,11 @@ func (s *Session) ConfirmPeer(peerID string) error {
 	if epoch == 0 {
 		return fmt.Errorf("%w: epoch 0x%08x", engine.ErrInvalidPeerID, epoch)
 	}
-	s.peerEpoch.Store(epoch)
+	// ai-generated: another peer, maybe an older build, starts a fresh
+	// relay window (olcrtc#15).
+	if s.peerEpoch.Swap(epoch) != epoch {
+		s.resetRelayWindows()
+	}
 	return nil
 }
 
@@ -213,6 +220,9 @@ func (s *Session) resetPeerEpochs() {
 	s.peerEpochMu.Lock()
 	clear(s.peerEpochs)
 	s.peerEpochMu.Unlock()
+	// ai-generated: the relay windows go with the peers they were kept for
+	// (olcrtc#15).
+	s.resetRelayWindows()
 }
 
 // PeerSeen implements transport.PeerObserver: a peer epoch is latched, or
