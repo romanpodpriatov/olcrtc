@@ -2,6 +2,7 @@ package vp8channel
 
 import (
 	"bytes"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -19,28 +20,37 @@ func releaseTestTransport(t *testing.T) *streamTransport {
 	return p
 }
 
-// ai-generated: retiring one peer must preserve real KCP delivery to its neighbor.
-func TestRetirePeerPreservesNeighborAndRejectsLateFrames(t *testing.T) {
+// silence backdates the last frame heard from epoch by d.
+// ai-generated: the whole helper.
+func silence(p *streamTransport, epoch uint32, d time.Duration) {
+	p.peers.mu.Lock()
+	if sess := p.peers.sessions[epoch]; sess != nil {
+		sess.lastSeen = time.Now().Add(-d).UnixNano()
+	}
+	p.peers.mu.Unlock()
+}
+
+// ai-generated: an ended, silent epoch is released and its neighbor keeps working.
+func TestRetirePeerReleasesSilentEpochAndKeepsNeighbor(t *testing.T) {
 	p := releaseTestTransport(t)
-	retired := p.peerSessionFor(2)
+	gone := p.peerSessionFor(2)
 	p.peerControlFor(2)
 	live := p.peerSessionFor(3)
 	ctrl := p.peerControlFor(3)
-	cleanup := p.RetirePeer(formatPeerID(2))
-	cleanup()
-	cleanup()
-	select {
-	case <-retired.data.conn.closed:
-	default:
-		t.Fatal("retired data KCP is still open")
+	silence(p, 2, time.Minute)
+	p.RetirePeer(formatPeerID(2))
+	p.RetirePeer(formatPeerID(2))
+	for name, done := range map[string]<-chan struct{}{
+		"writer pump": gone.done, "data KCP": gone.data.conn.closed,
+	} {
+		select {
+		case <-done:
+		default:
+			t.Fatalf("%s of the ended epoch is still running", name)
+		}
 	}
-	for range 10 {
-		p.handlePeerFrame(2, nil)
-		p.handlePeerFrame(2, []byte("late data"))
-		p.handleControlFrame(2|controlEpochFlag, 0, []byte("late control"))
-	}
-	if p.peerSessionFor(2) != nil || p.peerControlFor(2) != nil {
-		t.Fatal("late frame recreated a retired runtime")
+	if p.peers.lookup(2) != nil {
+		t.Fatal("ended epoch is still in the peer table")
 	}
 	if p.peerSessionFor(3) != live || p.peerControlFor(3) != ctrl {
 		t.Fatal("neighbor runtime was replaced")
@@ -76,7 +86,68 @@ func assertReleaseNeighborTraffic(t *testing.T, live *peerSession) {
 	}
 }
 
-// ai-generated: a full queue must not deadlock retirement or whole-room shutdown.
+// ai-generated: an ended epoch still heard from keeps its KCP state, because the
+// client retries its handshake on it, and goes once it falls silent.
+func TestRetirePeerKeepsAnEpochStillHeard(t *testing.T) {
+	p := releaseTestTransport(t)
+	sess := p.peerSessionFor(2)
+	control := p.peerControlFor(2)
+	p.RetirePeer(formatPeerID(2))
+	p.handlePeerFrame(2, nil)
+	if p.peerSessionFor(2) != sess || p.peerControlFor(2) != control {
+		t.Fatal("an epoch still heard from lost its KCP state")
+	}
+	p.peers.sweep(peerIdleTTL, retiredPeerIdle)
+	if p.peers.lookup(2) != sess {
+		t.Fatal("the sweep released an ended epoch that is still heard from")
+	}
+	silence(p, 2, 2*retiredPeerIdle)
+	p.peers.sweep(peerIdleTTL, retiredPeerIdle)
+	if p.peers.lookup(2) != nil {
+		t.Fatal("an ended, silent epoch waited for the idle TTL")
+	}
+}
+
+// ai-generated: a send from a new server session claims an ended epoch back, so
+// only the idle TTL applies to it again.
+func TestSendClaimsAnEndedEpoch(t *testing.T) {
+	p := releaseTestTransport(t)
+	p.peerSessionFor(2)
+	p.RetirePeer(formatPeerID(2))
+	if err := p.SendTo(formatPeerID(2), []byte("welcome")); err != nil {
+		t.Fatalf("SendTo: %v", err)
+	}
+	silence(p, 2, 2*retiredPeerIdle)
+	p.peers.sweep(peerIdleTTL, retiredPeerIdle)
+	if p.peers.lookup(2) == nil {
+		t.Fatal("a claimed epoch was released on the ended-session timeout")
+	}
+}
+
+// ai-generated: sends neither build a peer nor keep a silent one alive.
+func TestSendPathNeverBuildsOrRefreshesAPeer(t *testing.T) {
+	p := releaseTestTransport(t)
+	if err := p.ControlSendTo(formatPeerID(7), []byte("x")); err == nil {
+		t.Fatal("control send to an unknown peer succeeded")
+	}
+	if err := p.SendTo(formatPeerID(7), []byte("x")); err == nil {
+		t.Fatal("data send to an unknown peer succeeded")
+	}
+	if n := p.peers.len(); n != 0 {
+		t.Fatalf("sends built %d peers", n)
+	}
+	p.peerSessionFor(2)
+	silence(p, 2, time.Minute)
+	_ = p.ControlSendTo(formatPeerID(2), []byte("ping"))
+	_ = p.SendTo(formatPeerID(2), []byte("data"))
+	_ = p.ControlPeerCanSend(formatPeerID(2))
+	p.peers.sweep(30*time.Second, retiredPeerIdle)
+	if p.peers.lookup(2) != nil {
+		t.Fatal("the server's own writes kept a silent peer alive")
+	}
+}
+
+// ai-generated: a full queue must not deadlock release or whole-room shutdown.
 func TestPeerRetirementUnblocksFullQueue(t *testing.T) {
 	p := releaseTestTransport(t)
 	sess := p.peerSessionFor(2)
@@ -90,7 +161,8 @@ func TestPeerRetirementUnblocksFullQueue(t *testing.T) {
 	}()
 	finished := make(chan struct{})
 	go func() {
-		p.RetirePeer(formatPeerID(2))()
+		silence(p, 2, time.Minute)
+		p.RetirePeer(formatPeerID(2))
 		_ = p.Close()
 		close(finished)
 	}()
@@ -103,68 +175,76 @@ func TestPeerRetirementUnblocksFullQueue(t *testing.T) {
 	}
 }
 
-// ai-generated: concurrent data/control creation cannot escape a retirement fence.
-func TestPeerRetirementConcurrentCreation(t *testing.T) {
+// ai-generated: inbound frames, retirement and the sweep race without leaking: the
+// table's session is open, every session it dropped is closed.
+func TestPeerRetirementRacesInboundFrames(t *testing.T) {
 	p := releaseTestTransport(t)
-	var work sync.WaitGroup
-	for range 8 {
+	var (
+		mu   sync.Mutex
+		seen = make(map[*peerSession]struct{})
+		work sync.WaitGroup
+	)
+	stop := make(chan struct{})
+	for range 4 {
 		work.Go(func() {
-			for range 100 {
-				p.peerSessionFor(2)
-				p.peerControlFor(2)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				p.handlePeerFrame(2, nil)
+				p.handleControlFrame(2|controlEpochFlag, 0, []byte{0})
+				if sess := p.peerSessionFor(2); sess != nil {
+					mu.Lock()
+					seen[sess] = struct{}{}
+					mu.Unlock()
+				}
 			}
 		})
 	}
-	p.RetirePeer(formatPeerID(2))()
+	work.Go(func() {
+		for range 200 {
+			silence(p, 2, time.Minute)
+			p.RetirePeer(formatPeerID(2))
+			p.peers.sweep(peerIdleTTL, retiredPeerIdle)
+		}
+		close(stop)
+	})
 	work.Wait()
-	if p.peers.len() != 0 {
-		t.Fatal("concurrent callback recreated a retired epoch")
+	current := p.peers.lookup(2)
+	for sess := range seen {
+		select {
+		case <-sess.done:
+			if sess == current {
+				t.Fatal("the table holds a closed session")
+			}
+		default:
+			if sess != current {
+				t.Fatal("a session dropped from the table is still open")
+			}
+		}
 	}
 }
 
-// ai-generated: a delayed cleanup must not close an epoch reused after eviction.
-func TestRetirementFenceBoundedAndCleanupOwnsRuntime(t *testing.T) {
-	p := releaseTestTransport(t)
-	old := p.peerSessionFor(2)
-	cleanup := p.RetirePeer(formatPeerID(2))
-	for epoch := uint32(3); epoch < retiredPeerLimit+3; epoch++ {
-		p.RetirePeer(formatPeerID(epoch))()
-	}
-	if len(p.peers.retiredPeers) != retiredPeerLimit || p.PeerRetired(formatPeerID(2)) {
-		t.Fatal("retirement replay fence is not bounded")
-	}
-	// Model an epoch reused after the finite replay fence evicts it.
-	p.peers.mu.Lock()
-	delete(p.peers.sessions, 2)
-	p.peers.mu.Unlock()
-	live := p.peerSessionFor(2)
-	cleanup()
-	if p.peers.get(2) != live {
-		t.Fatal("delayed cleanup removed a replacement runtime")
-	}
-	select {
-	case <-old.data.conn.closed:
-	default:
-		t.Fatal("old runtime was not closed")
-	}
-	select {
-	case <-live.data.conn.closed:
-		t.Fatal("replacement runtime was closed")
-	default:
-	}
-}
-
-// ai-generated: expose the missing transport release contract on the baseline.
+// ai-generated: 100 departed epochs leave no KCP, queue or writer pump behind.
 func TestRepeatedSessionReleaseBoundsKCPObjects(t *testing.T) {
 	p := releaseTestTransport(t)
+	base := runtime.NumGoroutine()
 	for epoch := uint32(2); epoch < 102; epoch++ {
 		p.peerSessionFor(epoch)
 		p.peerControlFor(epoch)
-		if releaser, ok := any(p).(interface{ RetirePeer(peerID string) func() }); ok {
-			releaser.RetirePeer(formatPeerID(epoch))()
-		}
+		silence(p, epoch, time.Minute)
+		p.RetirePeer(formatPeerID(epoch))
 	}
 	if n := p.peers.len(); n != 0 {
 		t.Fatalf("after 100 departures: peers=%d", n)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > base+2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := runtime.NumGoroutine(); n > base+2 {
+		t.Fatalf("goroutines after 100 departures = %d, baseline %d", n, base)
 	}
 }

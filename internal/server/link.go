@@ -231,6 +231,7 @@ func (s *Server) closePeerRouting(teardown peerRoutingTeardown) {
 	}
 	for _, peer := range teardown.peers {
 		s.closePeerSession(peer, "reconnect")
+		s.retirePeer(peer.peerID) // ai-generated: the transport outlives a provider reconnect
 	}
 	s.closeAllUDPFlows()
 }
@@ -316,11 +317,6 @@ func (s *Server) closeSession() {
 	controlStop := s.controlStop
 	peers := s.peerSessions
 	oldSessionID := s.sessionID
-	// ai-generated: fence every old epoch before publishing an empty session map.
-	cleanups := make([]func(), 0, len(peers))
-	for peerID := range peers {
-		cleanups = append(cleanups, s.retirePeer(peerID))
-	}
 	s.peerSessions = make(map[string]*peerSession)
 	s.pair, s.session, s.controlSess = nil, nil, nil
 	s.conn, s.controlConn, s.group = nil, nil, nil
@@ -349,10 +345,6 @@ func (s *Server) closeSession() {
 	}
 	for _, peer := range peers {
 		s.closePeerSession(peer, "closed")
-	}
-	// ai-generated: release KCP resources after best-effort CLOSE notifications.
-	for _, cleanup := range cleanups {
-		cleanup()
 	}
 	s.closeAllUDPFlows()
 }

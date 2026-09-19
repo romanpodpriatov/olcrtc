@@ -57,7 +57,7 @@ func TestPeerTableSweepEvictsIdleSessions(t *testing.T) {
 	idle.lastSeen = time.Now().Add(-time.Hour).UnixNano()
 	table.mu.Unlock()
 
-	table.sweep(time.Minute)
+	table.sweep(time.Minute, time.Minute)
 
 	if got := table.len(); got != 1 {
 		t.Fatalf("len() after sweep = %d, want 1", got)
@@ -94,7 +94,7 @@ func TestPeerTableTouchKeepsBusyPeerAlive(t *testing.T) {
 
 	// A single inbound frame refreshes the timer.
 	table.get(7)
-	table.sweep(time.Minute)
+	table.sweep(time.Minute, time.Minute)
 
 	if got := table.len(); got != 1 {
 		t.Fatalf("len() after sweep = %d, want the touched peer to survive", got)

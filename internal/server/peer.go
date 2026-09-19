@@ -195,11 +195,6 @@ func (s *Server) getOrCreatePeerControlSession(peerID string) *peerSession {
 		return nil
 	}
 	s.sessMu.Lock()
-	// ai-generated: drop callbacks queued before transport retirement.
-	if s.peerRetired(peerID) {
-		s.sessMu.Unlock()
-		return nil
-	}
 	peer := s.peerSessions[peerID]
 	if peer != nil {
 		if conn, _ := peer.controlPlane(); conn != nil {
@@ -315,7 +310,7 @@ func (s *Server) onPeerData(peerID string, data []byte) {
 	peer := s.getPeerSession(peerID)
 	if peer == nil {
 		// Not in peer-routing mode: fall back to the single data conn.
-		// ai-generated: retired peer callbacks must not enter the singleton path.
+		// ai-generated: a routed peer's frame never belongs to the singleton path.
 		if s.peerLn == nil {
 			s.onData(data)
 		}
@@ -329,11 +324,6 @@ func (s *Server) getPeerSession(peerID string) *peerSession {
 		return nil
 	}
 	s.sessMu.Lock()
-	// ai-generated: drop callbacks queued before transport retirement.
-	if s.peerRetired(peerID) {
-		s.sessMu.Unlock()
-		return nil
-	}
 	peer := s.peerSessions[peerID]
 	if peer != nil && peer.dataConn() != nil {
 		s.sessMu.Unlock()
@@ -517,7 +507,9 @@ func (s *Server) waitPeerHandshake(peer *peerSession) bool {
 	}
 }
 
-// ai-generated: only the owning session may retire an epoch and release its KCPs.
+// removePeer ends peer if it is still the session for its peer ID, and then
+// tells the transport, after the CLOSE notification has gone out.
+// ai-generated: only the owning session retires the epoch, after teardown.
 func (s *Server) removePeer(peer *peerSession, reason string) {
 	if peer == nil {
 		return
@@ -527,11 +519,10 @@ func (s *Server) removePeer(peer *peerSession, reason string) {
 		s.sessMu.Unlock()
 		return
 	}
-	cleanup := s.retirePeer(peer.peerID)
 	delete(s.peerSessions, peer.peerID)
 	s.sessMu.Unlock()
-	defer cleanup()
 	s.closePeerSession(peer, reason)
+	s.retirePeer(peer.peerID)
 }
 
 func (s *Server) closePeerSession(peer *peerSession, reason string) {

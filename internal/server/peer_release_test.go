@@ -1,8 +1,12 @@
 package server
 
 import (
+	"context"
+	"slices"
 	"sync"
 	"testing"
+
+	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
 )
 
 // ai-generated: reproduce a delayed teardown removing a replacement session.
@@ -16,40 +20,74 @@ func TestStalePeerTeardownPreservesReplacement(t *testing.T) {
 	}
 }
 
-// ai-generated: record the two teardown phases without requiring a media provider.
+// retireLog records what the server tells the transport about ended peers.
+// ai-generated: the whole type.
+type retireLog struct {
+	retiredMu sync.Mutex
+	retired   []string
+}
+
+func (l *retireLog) RetirePeer(peerID string) {
+	l.retiredMu.Lock()
+	l.retired = append(l.retired, peerID)
+	l.retiredMu.Unlock()
+}
+
+func (l *retireLog) calls() []string {
+	l.retiredMu.Lock()
+	defer l.retiredMu.Unlock()
+	return slices.Clone(l.retired)
+}
+
+// ai-generated: a peer-routing transport that keeps per-peer state.
 type lifecycleStub struct {
 	peerRoutingStub
-	retired map[string]bool
-	closed  int
+	retireLog
 }
 
-// ai-generated: retirement runs under the server's session lock in these tests.
-func (p *lifecycleStub) RetirePeer(peerID string) func() {
-	p.retired[peerID] = true
-	return sync.OnceFunc(func() { p.closed++ })
-}
-
-// ai-generated: reject a queued callback after its session has been removed.
-func (p *lifecycleStub) PeerRetired(peerID string) bool {
-	return p.retired[peerID]
-}
-
-// ai-generated: release exactly once, after closing the owning session.
-func TestPeerSessionReleaseOrdering(t *testing.T) {
-	ln := &lifecycleStub{retired: make(map[string]bool)}
-	ps := &peerSession{peerID: "00000042"}
-	s := &Server{ln: ln, peerLn: ln, peerSessions: map[string]*peerSession{ps.peerID: ps}}
-	ps.controlStop = func() {
-		if !ln.PeerRetired(ps.peerID) || ln.closed != 0 {
-			t.Error("transport must be fenced but still available for final CLOSE")
-		}
-		if s.getPeerSession(ps.peerID) != nil || s.getOrCreatePeerControlSession(ps.peerID) != nil {
-			t.Error("queued callback recreated a retired server session")
+// ai-generated: the transport hears once, from the owning session, after teardown.
+func TestPeerSessionEndRetiresEpochAfterTeardown(t *testing.T) {
+	ln := &lifecycleStub{}
+	peer := &peerSession{peerID: "00000042"}
+	s := &Server{ln: ln, peerLn: ln, peerSessions: map[string]*peerSession{peer.peerID: peer}}
+	peer.controlStop = func() {
+		if len(ln.calls()) != 0 {
+			t.Error("transport was told before the session's teardown")
 		}
 	}
-	s.removePeer(ps, "closed")
-	s.removePeer(ps, "liveness")
-	if ln.closed != 1 || len(s.peerSessions) != 0 {
-		t.Fatalf("cleanup count=%d sessions=%d", ln.closed, len(s.peerSessions))
+	s.removePeer(peer, "closed")
+	s.removePeer(peer, "liveness")
+	if got := ln.calls(); !slices.Equal(got, []string{peer.peerID}) {
+		t.Fatalf("RetirePeer calls = %v, want exactly [%s]", got, peer.peerID)
 	}
+	live := &peerSession{peerID: peer.peerID}
+	s.peerSessions[live.peerID] = live
+	s.removePeer(peer, "closed")
+	if got := ln.calls(); len(got) != 1 {
+		t.Fatalf("a stale session's callback retired its replacement: %v", got)
+	}
+}
+
+// ai-generated: a per-peer control transport that keeps per-peer state.
+type retiringControlStub struct {
+	peerControlRoutingStub
+	retireLog
+}
+
+// ai-generated: a provider reconnect ends every peer session while the transport
+// lives on, so each of their epochs is retired.
+func TestPeerRoutingReconnectRetiresEpochs(t *testing.T) {
+	link := &retiringControlStub{}
+	s := reconnectTestServer(t, &link.peerRoutingStub)
+	s.ln, s.peerLn = link, link
+	for _, id := range []string{"00000001", "00000002"} {
+		s.peerSessions[id] = newPeerSession(id, true, muxconn.PrePinned(newServerTestKeys(t), ""))
+	}
+	s.handleReconnect(context.Background())
+	got := link.calls()
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"00000001", "00000002"}) {
+		t.Fatalf("RetirePeer calls after reconnect = %v", got)
+	}
+	s.closeSession()
 }
