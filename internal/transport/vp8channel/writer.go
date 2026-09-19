@@ -18,20 +18,32 @@ type writerState struct {
 	// pendingControl holds a control frame that failed WriteSample and must be
 	// retried on the next tick before consuming more frames.
 	pendingControl *packetBuffer
-	pendingData    *packetBuffer
+	// data carries the single-peer data queue (ai-generated: issue #12).
+	data dataLane
 	// pendingDatagram is a lossy sample that failed WriteSample, or the
 	// first datagram of the next route split off by batchDatagramSampleFrom.
 	pendingDatagram []byte
-	batchBuf        []byte
+}
+
+// newWriterState is writerLoop's bookkeeping for p.
+//
+// ai-generated: the constructor, with the data lane.
+func newWriterState(p *streamTransport) *writerState {
+	return &writerState{
+		p:                   p,
+		keepaliveEvery:      max(int(keepaliveIdlePeriod/p.frameInterval), 1),
+		forceKeepaliveEvery: max(int(forceKeepalivePeriod/p.frameInterval), 1),
+		data: dataLane{
+			out: p.data.out, acks: p.data.acks, conn: p.dataConn, window: p.dataWindow, name: "data",
+		},
+	}
 }
 
 func (w *writerState) releasePending() {
 	if w.pendingControl != nil {
 		w.pendingControl.release()
 	}
-	if w.pendingData != nil {
-		w.pendingData.release()
-	}
+	w.data.release()
 }
 
 func (w *writerState) writeSample(data []byte) bool {
@@ -165,34 +177,39 @@ func (w *writerState) batchDatagramSampleFrom(src <-chan []byte, first []byte) [
 }
 
 // drainData sends one batched data frame, or a keepalive when idle.
+//
+// ai-generated: the data lane in place of the inline batching.
 func (w *writerState) drainData() {
-	frame := w.pendingData
-	w.pendingData = nil
-	if frame == nil {
-		select {
-		case frame = <-w.p.data.out:
-		default:
-		}
-	}
-	if frame == nil {
-		w.idleTicks++
-		if w.idleTicks >= w.keepaliveEvery {
-			w.idleTicks = 0
-			hdr := w.p.epochHeader()
-			_ = w.writeSample(hdr[:])
-		}
+	if w.data.flush(w.p, w.writeSample) {
+		w.idleTicks = 0
 		return
 	}
-	w.idleTicks = 0
-	if !w.p.canBatch(frame.data) {
-		_ = w.writeSample(frame.data)
-		frame.release()
-		return
+	w.idleTicks++
+	if w.idleTicks >= w.keepaliveEvery {
+		w.idleTicks = 0
+		hdr := w.p.epochHeader()
+		_ = w.writeSample(hdr[:])
 	}
-	sample, pending := w.p.batchSampleFrom(w.p.data.out, frame, w.batchBuf[:0])
-	w.pendingData = pending
-	_ = w.writeSample(sample)
-	w.batchBuf = sample[:0]
+}
+
+// dataConn is the single-peer data plane's KCP conn, nil while the plane is
+// down or mid-restart.
+//
+// ai-generated: the whole function.
+func (p *streamTransport) dataConn() *kcpConn {
+	if rt := p.data.get(); rt != nil {
+		return rt.conn
+	}
+	return nil
+}
+
+// dataWindow sets the single-peer data plane's KCP send window.
+//
+// ai-generated: the whole function.
+func (p *streamTransport) dataWindow(segments int) {
+	if rt := p.data.get(); rt != nil {
+		rt.sess.SetWindowSize(segments, 0)
+	}
 }
 
 func (p *streamTransport) writerLoop() {
@@ -201,11 +218,7 @@ func (p *streamTransport) writerLoop() {
 	ticker := time.NewTicker(p.frameInterval)
 	defer ticker.Stop()
 
-	w := &writerState{
-		p:                   p,
-		keepaliveEvery:      max(int(keepaliveIdlePeriod/p.frameInterval), 1),
-		forceKeepaliveEvery: max(int(forceKeepalivePeriod/p.frameInterval), 1),
-	}
+	w := newWriterState(p)
 	defer w.releasePending()
 
 	for {
@@ -234,9 +247,13 @@ func (p *streamTransport) writerLoop() {
 // client->server path, batching queued frames into one VP8 sample per tick.
 // Draining on the ticker (rather than emitting each frame the instant it is
 // queued) keeps the per-peer writes interleaved with the keyframe injection
-// below and lets batchSampleFrom coalesce segments into full samples. Stops
-// when the peer session is released or the transport shuts down.
-func (p *streamTransport) peerWriterPump(out chan *packetBuffer, done <-chan struct{}) {
+// below and lets batchSampleFrom coalesce segments into full samples. The
+// queue goes out through a data lane, which holds it back while the peer
+// acknowledges nothing (lane.go). Stops when the peer session is released or
+// the transport shuts down.
+//
+// ai-generated: the lane in place of the pump's own batching.
+func (p *streamTransport) peerWriterPump(lane dataLane, done <-chan struct{}) {
 	ticker := time.NewTicker(p.frameInterval)
 	defer ticker.Stop()
 
@@ -250,13 +267,7 @@ func (p *streamTransport) peerWriterPump(out chan *packetBuffer, done <-chan str
 	// client->server direction kept flowing (issue #95).
 	keyframeEvery := max(int(forceKeepalivePeriod/p.frameInterval), 1)
 	ticksSinceKeyframe := 0
-	var batchBuf []byte
-	var pending *packetBuffer
-	defer func() {
-		if pending != nil {
-			pending.release()
-		}
-	}()
+	defer lane.release()
 
 	for {
 		select {
@@ -271,30 +282,7 @@ func (p *streamTransport) peerWriterPump(out chan *packetBuffer, done <-chan str
 				hdr := p.epochHeader()
 				_ = p.writeSampleLocked(hdr[:])
 			}
-			frame := pending
-			pending = nil
-			if frame == nil {
-				select {
-				case next, ok := <-out:
-					if !ok {
-						return
-					}
-					frame = next
-				default:
-				}
-			}
-			if frame == nil {
-				continue
-			}
-			if !p.canBatch(frame.data) {
-				_ = p.writeSampleLocked(frame.data)
-				frame.release()
-				continue
-			}
-			var sample []byte
-			sample, pending = p.batchSampleFrom(out, frame, batchBuf[:0])
-			_ = p.writeSampleLocked(sample)
-			batchBuf = sample[:0]
+			lane.flush(p, p.writeSampleLocked)
 		}
 	}
 }
@@ -313,17 +301,30 @@ func (p *streamTransport) batchSampleFrom(
 	first *packetBuffer,
 	dst []byte,
 ) ([]byte, *packetBuffer) {
+	return p.batchSampleUpTo(src, first, dst, p.batchSize)
+}
+
+// batchSampleUpTo is batchSampleFrom with at most limit packets in the
+// sample: a data lane under a cap asks for fewer.
+//
+// ai-generated: the limit, split out of batchSampleFrom (issue #12).
+func (p *streamTransport) batchSampleUpTo(
+	src <-chan *packetBuffer,
+	first *packetBuffer,
+	dst []byte,
+	limit int,
+) ([]byte, *packetBuffer) {
 	if !p.canBatch(first.data) {
 		return first.data, nil
 	}
 
-	sample := p.prepareBatchBuffer(dst, src, first.data)
+	sample := prepareBatchBuffer(dst, src, first.data, limit)
 	sample = append(sample, first.data[:epochHdrLen]...)
 	sample = append(sample, kcpBatchMagic[:]...)
 	sample = appendBatchPacket(sample, first.data[epochHdrLen:])
 	first.release()
 
-	for packets := 1; packets < p.batchSize; packets++ {
+	for packets := 1; packets < limit; packets++ {
 		select {
 		case frame, ok := <-src:
 			if !ok {
@@ -346,9 +347,9 @@ func (p *streamTransport) batchSampleFrom(
 	return sample, nil
 }
 
-func (p *streamTransport) prepareBatchBuffer(dst []byte, src <-chan *packetBuffer, first []byte) []byte {
+func prepareBatchBuffer(dst []byte, src <-chan *packetBuffer, first []byte, limit int) []byte {
 	packetSize := len(first) - epochHdrLen
-	packetCount := min(p.batchSize, len(src)+1)
+	packetCount := max(min(limit, len(src)+1), 1)
 	want := epochHdrLen + len(kcpBatchMagic) + packetCount*(2+packetSize)
 	if want > defaultMaxPayloadSize {
 		want = defaultMaxPayloadSize

@@ -211,7 +211,7 @@ func TestWriterDrainsDatagramBeforeReliableData(t *testing.T) {
 		writes = append(writes, append([]byte(nil), data...))
 		return true
 	}
-	w := &writerState{p: tr}
+	w := newWriterState(tr)
 	if !w.drainDatagram() {
 		t.Fatal("drainDatagram() = false, want true")
 	}
@@ -236,7 +236,7 @@ func TestWriterRetriesAFailedDatagramSample(t *testing.T) {
 		writes++
 		return accept
 	}
-	w := &writerState{p: tr}
+	w := newWriterState(tr)
 	if w.drainDatagram() {
 		t.Fatal("drainDatagram() = true while the track refuses samples")
 	}
@@ -262,7 +262,7 @@ func TestWriterBatchesDatagramsWithSameRoute(t *testing.T) {
 		writes = append(writes, append([]byte(nil), data...))
 		return true
 	}
-	w := &writerState{p: tr}
+	w := newWriterState(tr)
 	sample := w.batchDatagramSampleFrom(tr.datagram, first)
 	if !w.writeSample(sample) {
 		t.Fatal("writeSample(datagram batch) = false, want true")
@@ -284,7 +284,7 @@ func TestWriterKeepsDifferentDatagramRoutesSeparate(t *testing.T) {
 	second := mkDatagramFrame(tr.bindingToken, 0x200, 0x400, []byte("two"))
 	tr.datagram <- second
 
-	w := &writerState{p: tr}
+	w := newWriterState(tr)
 	sample := w.batchDatagramSampleFrom(tr.datagram, first)
 	packets, ok := splitDatagramBatchPayload(sample[epochHdrLen:])
 	if !ok || len(packets) != 1 {

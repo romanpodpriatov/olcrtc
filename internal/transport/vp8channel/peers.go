@@ -267,12 +267,13 @@ func (p *streamTransport) peerSessionFor(epoch uint32) *peerSession {
 
 	peerID := formatPeerID(epoch)
 	out := make(chan *packetBuffer, outboundQueueSize)
+	acks := make(chan *packetBuffer, ackQueueSize) // ai-generated: issue #12
 
 	// Address downlink frames to the specific client epoch so other clients
 	// do not ingest them (issue #95 multi-client cross-talk).
 	hdr := buildEpochHeaderTo(p.bindingToken, p.localEpochValue(), epoch)
 
-	data, err := startKCP(out, func(payload []byte) {
+	data, err := startKCPAcks(out, acks, func(payload []byte) {
 		if p.onPeerData != nil {
 			p.onPeerData(peerID, payload)
 		}
@@ -294,7 +295,14 @@ func (p *streamTransport) peerSessionFor(epoch uint32) *peerSession {
 	logger.Infof("vp8channel: peer session created epoch=0x%08x peers=%d", epoch, p.peers.len())
 
 	// Pump outbound frames from this peer's queue into the writer.
-	go p.peerWriterPump(out, sess.done)
+	// ai-generated: through a data lane (issue #12).
+	go p.peerWriterPump(dataLane{
+		out:    out,
+		acks:   acks,
+		conn:   func() *kcpConn { return data.conn },
+		window: func(segments int) { data.sess.SetWindowSize(segments, 0) },
+		name:   "peer " + peerID,
+	}, sess.done)
 
 	return sess
 }

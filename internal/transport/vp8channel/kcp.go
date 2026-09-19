@@ -107,7 +107,19 @@ type kcpRuntime struct {
 }
 
 func startKCP(out chan<- *packetBuffer, onData func([]byte), epochHdr [epochHdrLen]byte) (*kcpRuntime, error) {
+	return startKCPAcks(out, nil, onData, epochHdr)
+}
+
+// startKCPAcks is startKCP with the packets that only acknowledge the peer
+// queued on acks, apart from the data (see kcpConn.acks). A nil acks queues
+// them with the data.
+//
+// ai-generated: the acks queue (issue #12).
+func startKCPAcks(
+	out, acks chan<- *packetBuffer, onData func([]byte), epochHdr [epochHdrLen]byte,
+) (*kcpRuntime, error) {
 	c := newKCPConn(out, inboundQueueSizeFor(), epochHdr)
+	c.acks = acks
 
 	sess, err := kcp.NewConn3(kcpConvID, fakeUDPAddr(), nil, 0, 0, c)
 	if err != nil {
@@ -221,7 +233,10 @@ func (r *kcpRuntime) close() {
 // identical lifecycle rules, so start/restart/drain/close live here once
 // instead of being written twice with only the field names changed.
 type kcpPlane struct {
-	out    chan *packetBuffer
+	out chan *packetBuffer
+	// acks queues what only acknowledges the peer on a data plane, nil on
+	// the control plane (ai-generated: issue #12).
+	acks   chan *packetBuffer
 	onData func([]byte)
 
 	// lifecycleMu serializes start/restart/close. Without it two concurrent
@@ -240,6 +255,16 @@ type kcpPlane struct {
 
 func newKCPPlane(queueSize int, onData func([]byte)) *kcpPlane {
 	return &kcpPlane{out: make(chan *packetBuffer, queueSize), onData: onData}
+}
+
+// newDataPlane is a plane whose runtimes queue what only acknowledges the
+// peer on acks, for the data lane to write ahead of the data.
+//
+// ai-generated: the whole function (issue #12).
+func newDataPlane(queueSize int, onData func([]byte)) *kcpPlane {
+	p := newKCPPlane(queueSize, onData)
+	p.acks = make(chan *packetBuffer, ackQueueSize)
+	return p
 }
 
 // get returns the live runtime, or nil when the plane has not started (or is
@@ -273,7 +298,7 @@ func (p *kcpPlane) start(hdr [epochHdrLen]byte) (bool, error) {
 			return
 		}
 		var rt *kcpRuntime
-		rt, err = startKCP(p.out, p.onData, hdr)
+		rt, err = startKCPAcks(p.out, p.acks, p.onData, hdr)
 		if err != nil {
 			return
 		}
@@ -305,7 +330,7 @@ func (p *kcpPlane) restart(hdr [epochHdrLen]byte) {
 		old.close()
 	}
 
-	rt, err := startKCP(p.out, p.onData, hdr)
+	rt, err := startKCPAcks(p.out, p.acks, p.onData, hdr)
 	if err != nil {
 		return
 	}
@@ -317,6 +342,8 @@ func (p *kcpPlane) drain() {
 	for {
 		select {
 		case packet := <-p.out:
+			packet.release()
+		case packet := <-p.acks: // ai-generated: never ready on a plane without acks
 			packet.release()
 		default:
 			return

@@ -42,7 +42,12 @@ func fakeUDPAddr() *net.UDPAddr {
 // All packet boundaries are preserved by the underlying transport, which is
 // exactly what KCP expects from a UDP-like conn.
 type kcpConn struct {
-	out       chan<- *packetBuffer
+	out chan<- *packetBuffer
+	// acks, when set, takes the packets that only acknowledge the peer, so
+	// the lane writes them ahead of its queued data: an acknowledgement
+	// behind seconds of pushes tells the peer the path is dark.
+	// ai-generated: issue #12.
+	acks      chan<- *packetBuffer
 	in        chan *packetBuffer
 	inPools   [4]sync.Pool
 	outPools  [4]sync.Pool
@@ -69,6 +74,16 @@ type kcpConn struct {
 	truncated    atomic.Uint64
 	lastWarnNano atomic.Int64
 
+	// lastAck is when the peer last answered a push or a window probe, on
+	// monoNow's clock. The data lane reads it to tell a dark path from a
+	// slow one. holdEvery is non-zero while the lane holds pushes back:
+	// WriteTo then drops the pushes KCP resends but one per holdEvery, the
+	// next due at probeAt, and lets through whatever answers the peer.
+	// ai-generated: issue #12.
+	lastAck   atomic.Int64
+	holdEvery atomic.Int64
+	probeAt   atomic.Int64
+
 	mu        sync.Mutex
 	rDeadline time.Time
 	wDeadline time.Time
@@ -77,6 +92,10 @@ type kcpConn struct {
 type packetBuffer struct {
 	data []byte
 	pool *sync.Pool
+	// queued is when WriteTo queued the packet, on monoNow's clock; zero on
+	// the inbound side. ai-generated: issue #12, a capped lane drops pushes
+	// that waited too long.
+	queued int64
 }
 
 func packetBufferClass(size int) (int, int, bool) {
@@ -162,6 +181,9 @@ func (c *kcpConn) deliver(payload []byte) {
 		c.corrupt.Add(1)
 		return
 	}
+	if answers(body) { // ai-generated: issue #12
+		c.lastAck.Store(monoNow())
+	}
 	packet := acquirePacketBuffer(&c.inPools, len(body))
 	copy(packet.data, body)
 	select {
@@ -226,16 +248,50 @@ func (c *kcpConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	}
 }
 
+// hold has WriteTo drop pushes but one per every; zero lets them all through.
+//
+// ai-generated: issue #12.
+func (c *kcpConn) hold(every time.Duration) {
+	c.probeAt.Store(0)
+	c.holdEvery.Store(int64(every))
+}
+
+// withheld reports whether WriteTo drops p: a push, while pushes are held
+// back, with the next probe not due. What answers the peer always goes.
+//
+// ai-generated: issue #12.
+func (c *kcpConn) withheld(p []byte) bool {
+	every := c.holdEvery.Load()
+	if every == 0 || answers(p) || !pushes(p) {
+		return false
+	}
+	now := monoNow()
+	at := c.probeAt.Load()
+	return now < at || !c.probeAt.CompareAndSwap(at, now+every)
+}
+
 func (c *kcpConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	if c.withheld(p) { // ai-generated: issue #12, as a full path would drop it
+		return len(p), nil
+	}
 	// Layout: [epoch header][KCP packet p][CRC32(p)]. The receiver strips the
 	// epoch header before deliver(), which then verifies and strips the CRC.
 	packet := acquirePacketBuffer(&c.outPools, epochHdrLen+len(p)+wireCRCLen)
+	packet.queued = monoNow()
 	buf := packet.data
 	c.hdrMu.RLock()
 	copy(buf, c.epochHdr[:])
 	c.hdrMu.RUnlock()
 	copy(buf[epochHdrLen:], p)
 	binary.BigEndian.PutUint32(buf[epochHdrLen+len(p):], crc32.Checksum(p, crcTable))
+
+	if c.acks != nil && answers(p) && !pushes(p) { // ai-generated: issue #12
+		select {
+		case c.acks <- packet:
+			return len(p), nil
+		default: // full: it waits with the data
+		}
+	}
 
 	c.mu.Lock()
 	deadline := c.wDeadline

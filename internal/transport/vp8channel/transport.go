@@ -69,7 +69,11 @@ const (
 	// suffices. We keep it separate from bulk data to guarantee forward
 	// progress even when the data outbound queue is saturated.
 	controlOutboundQueueSize = 2048 // sized for ~20s publisher reconnect window at 20ms tick
-	inboundQueueSize         = 4096
+	// ackQueueSize bounds the packets that only acknowledge the peer, which
+	// the data lane writes ahead of the data, a batch a frame; beyond it they
+	// wait with the data. ai-generated: issue #12.
+	ackQueueSize     = 256
+	inboundQueueSize = 4096
 	// The same queues on a host that is killed for using memory. Each slot is
 	// a pooled ~1.4 KB packet, so 4096 inbound and 1536 outbound are 8 MB of
 	// headroom the server profile can afford and a packet tunnel extension
@@ -175,6 +179,14 @@ type streamTransport struct {
 	peerRestartGrace  time.Duration
 	linkUnhealthy     atomic.Bool
 
+	// blackoutAfter, probeEvery and growEvery tune when a data lane counts
+	// its direction as dark, how often it probes it then, and how fast a
+	// capped lane grows back (lane.go). Zero means the default; tests
+	// shorten them. ai-generated: issue #12.
+	blackoutAfter time.Duration
+	probeEvery    time.Duration
+	growEvery     time.Duration
+
 	peerConfirmed atomic.Bool
 	// peerSeen records that any foreign epoch sent a well-formed frame with
 	// our binding token since the last plane restart (transport.PeerObserver).
@@ -259,7 +271,7 @@ func newStreamTransport(
 		peerRestartGrace: defaultPeerRestartGrace,
 	}
 
-	tr.data = newKCPPlane(outboundQueueSizeFor(), func(data []byte) {
+	tr.data = newDataPlane(outboundQueueSizeFor(), func(data []byte) {
 		if tr.onData != nil {
 			tr.onData(data)
 		}
